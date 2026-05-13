@@ -1,0 +1,60 @@
+# configs/stage3.yaml
+# Stage 3: Policy Training (GRPO)
+
+experiment:
+  name: swm_stage3
+  seed: 42
+  output_dir: outputs/stage3
+
+data:
+  dataset: mimicgen
+  task: square
+  data_root: data/mimicgen
+  image_size: 224
+  num_workers: 4
+  # Success trajectories for Goal Graph extraction
+  success_traj_dir: data/mimicgen/success_trajs
+
+stage1_ckpt: outputs/stage1/best.pt
+stage2_ckpt: outputs/stage2/best.pt
+
+policy:
+  backbone: openvla_oft        # openvla_oft | dit
+  openvla_ckpt: checkpoints/openvla_oft/model.pt
+  # Replace DINOv2 with V-JEPA-AC spatial encoder
+  replace_dino_with_vjepa: true
+  vjepa2_ac_ckpt: checkpoints/vjepa2_ac/predictor.pt
+  freeze_siglip: true          # keep SigLIP frozen
+  freeze_vjepa: false          # fine-tune V-JEPA spatial branch
+  action_dim: 7
+  action_chunk_size: 4         # K actions per chunk (32-step rollout with T=8)
+  use_peft: true
+  peft_r: 16
+  peft_alpha: 32
+
+grpo:
+  G: 8                         # number of trajectory samples per state
+  T: 8                         # rollout steps (T * chunk_size = total horizon)
+  # Reward: Graph distance (dense, continuous)
+  reward_type: graph_distance  # graph_distance | sparse_binary
+  reward_temperature: 1.0      # scale reward before advantage computation
+  # GRPO hyperparams
+  clip_epsilon: 0.2
+  kl_coef: 0.01
+  entropy_coef: 0.001
+  normalize_advantage: true
+  # Sampling diversity
+  sampling_temperature: 1.0
+  top_p: 0.9
+
+training:
+  iterations: 100
+  batch_size: 1                # one initial state per step
+  lr: 1.0e-6
+  weight_decay: 0.0
+  grad_clip: 1.0
+  amp: true
+  log_interval: 10
+  save_interval: 10
+  eval_interval: 10
+  eval_episodes: 50

@@ -1,0 +1,62 @@
+# configs/stage1.yaml
+# Stage 1: Encoder Training
+
+experiment:
+  name: swm_stage1
+  seed: 42
+  output_dir: outputs/stage1
+
+data:
+  dataset: mimicgen          # mimicgen | robosuite | real
+  task: square               # square | coffee | stack_three
+  data_root: data/mimicgen
+  image_size: 224
+  num_workers: 4
+  train_split: 0.9
+
+encoder:
+  backbone: vjepa2           # vjepa2 | dinov2 | resnet50
+  vjepa2_model: vit_giant    # vit_giant | vit_large
+  vjepa2_ckpt: checkpoints/vjepa2/vit_giant.pt
+  freeze_backbone: false     # fine-tune backbone with Graph/Depth heads
+  embed_dim: 1408            # ViT-Giant output dim
+  # Graph GNN branch (fused with visual features)
+  use_graph_branch: true
+  graph_hidden_dim: 256
+  graph_embed_dim: 512
+
+heads:
+  # Graph Node Position Head
+  graph_head:
+    hidden_dims: [512, 256]
+    output_dim: null           # set at runtime (num_nodes * 3)
+    dropout: 0.1
+
+  # Sparse Depth Head
+  depth_head:
+    grid_size: 32              # 32x32 sparse depth grid
+    hidden_dims: [512, 256]
+    dropout: 0.1
+
+loss:
+  lambda_graph: 1.0
+  lambda_depth: 0.5
+  graph_loss: l2               # l2 | l1 | smooth_l1
+  depth_loss: smooth_l1
+
+training:
+  epochs: 50
+  batch_size: 32
+  lr: 1.0e-4
+  lr_backbone: 1.0e-5          # smaller lr for pretrained backbone
+  weight_decay: 1.0e-4
+  warmup_epochs: 5
+  scheduler: cosine
+  grad_clip: 1.0
+  amp: true                    # mixed precision
+  log_interval: 50
+  save_interval: 5
+
+# Teacher Forcing for Stage 1 is not needed (single timestep)
+# Checkpoint to freeze after Stage 1
+freeze_after_training: true
