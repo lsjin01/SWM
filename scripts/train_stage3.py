@@ -2,122 +2,69 @@
 # scripts/train_stage3.py
 """
 Stage 3: Policy Training (GRPO)
-  z_t + instruction → Policy → action chunk (non-AR)
-  Repeated T times  → imagined trajectory
-  Reward: ‖ Ĝ_T − G*_T ‖²  (dense, no reward model needed)
-  Update: GRPO
+================================
+
+전체 흐름:
+  1. image → V-JEPA-2 encoder → z_0  (초기 latent)
+  2. z_0 + instruction → OpenVLA-OFT → action_chunk_0  (non-AR, chunk 단위)
+  3. z_0 + action_mean_0 → Transition → z_1
+  4. z_1 + instruction → OpenVLA-OFT → action_chunk_1
+  5. ... T번 반복 → z_T
+  6. z_T → frozen Graph Head → Ĝ_T
+  7. Reward = -‖Ĝ_T − G*_T‖²  (dense, 별도 reward model 불필요)
+  8. GRPO → Policy(OpenVLA-OFT) 업데이트
+
+G개 trajectory 병렬 샘플링 → group-relative advantage
 """
 
 import sys
+import random
 import argparse
 import logging
-import random
 from pathlib import Path
 
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
 from omegaconf import OmegaConf
-import wandb
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from models.encoder import SWMEncoder
 from models.heads import SWMHeads
 from models.transition import SWMTransition
+from models.policy import SWMPolicy
+from data.dataset import GoalGraphDataset, InitialStateDataset
 from utils.grpo import compute_graph_distance_reward, compute_grpo_loss
-from data.dataset import GoalGraphDataset
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s  %(levelname)s  %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)s  %(message)s"
+)
 log = logging.getLogger(__name__)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Policy stub — replace with your OpenVLA-OFT wrapper
-# ─────────────────────────────────────────────────────────────────────────────
-
-class PolicyWrapper(nn.Module):
-    """
-    Wraps OpenVLA-OFT.
-
-    Expected interface:
-        actions, log_probs = policy.sample(z, instruction,
-                                           chunk_size, temperature)
-        actions:   (B, chunk_size, action_dim)
-        log_probs: (B, chunk_size, action_dim)
-    """
-
-    def __init__(self, cfg, device):
-        super().__init__()
-        self.cfg = cfg
-        self.device = device
-        self.action_dim = cfg.policy.action_dim
-        self.chunk_size = cfg.policy.action_chunk_size
-        self._load_policy()
-
-    def _load_policy(self):
-        try:
-            # TODO: replace with actual OpenVLA-OFT loading
-            # from openvla_oft import OpenVLAOFT
-            # self.model = OpenVLAOFT.from_pretrained(self.cfg.policy.openvla_ckpt)
-            log.warning("PolicyWrapper: using RANDOM policy stub. "
-                        "Replace with real OpenVLA-OFT.")
-            self.model = None
-        except Exception as e:
-            log.error(f"Policy load failed: {e}")
-            self.model = None
-
-    def sample(
-        self,
-        z: torch.Tensor,         # (B, latent_dim)
-        instruction: str,
-        chunk_size: int = 4,
-        temperature: float = 1.0,
-    ):
-        B = z.shape[0]
-        if self.model is None:
-            # Random stub for testing pipeline
-            actions = torch.randn(B, chunk_size, self.action_dim,
-                                  device=z.device) * temperature
-            log_probs = torch.zeros_like(actions) - 1.0
-            return actions, log_probs
-
-        return self.model.sample(z, instruction,
-                                 chunk_size=chunk_size,
-                                 temperature=temperature)
-
-    def log_prob(
-        self,
-        z: torch.Tensor,
-        instruction: str,
-        actions: torch.Tensor,
-    ) -> torch.Tensor:
-        """Re-compute log π_θ(a|s) for given actions (for GRPO ratio)."""
-        if self.model is None:
-            return torch.zeros_like(actions) - 1.0
-        return self.model.log_prob(z, instruction, actions)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_frozen_components(cfg, device):
-    """Load and freeze Encoder, Heads, Transition from Stage 1 & 2."""
-    encoder = SWMEncoder(backbone=cfg.encoder.backbone
-                         if hasattr(cfg, "encoder") else "vjepa2").to(device)
-    heads = SWMHeads(latent_dim=encoder.latent_dim).to(device)
-
+    """Stage 1, 2 체크포인트 로드 후 freeze."""
+    # Encoder + Heads (Stage 1)
+    encoder = SWMEncoder(latent_dim=cfg.get("latent_dim", 1024)).to(device)
+    heads   = SWMHeads(latent_dim=encoder.latent_dim).to(device)
     s1 = torch.load(cfg.stage1_ckpt, map_location=device)
     encoder.load_state_dict(s1["encoder"])
     heads.load_state_dict(s1["heads"])
 
-    transition = SWMTransition(latent_dim=encoder.latent_dim,
-                               action_dim=cfg.policy.action_dim).to(device)
+    # Transition (Stage 2)
+    transition = SWMTransition(
+        latent_dim=encoder.latent_dim,
+        action_dim=cfg.policy.action_dim,
+    ).to(device)
     s2 = torch.load(cfg.stage2_ckpt, map_location=device)
     transition.load_state_dict(s2["transition"])
 
     for m in [encoder, heads, transition]:
-        for p in m.parameters():
-            p.requires_grad = False
+        for p in m.parameters(): p.requires_grad = False
         m.eval()
 
     log.info("Frozen: Encoder, Heads, Transition")
@@ -126,46 +73,81 @@ def load_frozen_components(cfg, device):
 
 @torch.no_grad()
 def imagined_rollout(
-    z0: torch.Tensor,           # (G, latent_dim)
-    policy,
-    transition,
+    z0: torch.Tensor,          # (G, latent_dim)
+    policy: SWMPolicy,
+    transition: SWMTransition,
     instruction: str,
     T: int,
     chunk_size: int,
     temperature: float,
+    device,
 ):
     """
-    Run T steps of policy + transition in latent space.
-    Returns final z_T and collected (actions, log_probs).
+    T번 반복:
+      z_t → Policy → action_chunk_t (non-AR)
+      z_t + action_mean_t → Transition → z_t+1 (AR)
+
+    Returns:
+      z_T:        (G, latent_dim)  최종 latent
+      all_actions:(G, T, chunk_size, action_dim)
+      all_lp:     (G, T, chunk_size, action_dim)
     """
     z = z0
-    all_actions   = []
-    all_log_probs = []
+    all_actions = []
+    all_lp      = []
 
     for t in range(T):
-        actions, log_probs = policy.sample(z, instruction,
-                                           chunk_size=chunk_size,
-                                           temperature=temperature)
+        # Policy: z_t → action chunk (non-AR)
+        actions, log_probs = policy.sample(
+            z, instruction,
+            chunk_size=chunk_size,
+            temperature=temperature,
+        )
         # actions: (G, chunk_size, action_dim)
-        # Use mean action of chunk for transition step
-        a_mean = actions.mean(dim=1)              # (G, action_dim)
-        z = transition(z, a_mean, training=False) # (G, latent_dim)
+
+        # Transition: z_t + mean(action) → z_t+1
+        a_mean = actions.mean(dim=1)                    # (G, action_dim)
+        z = transition(z, a_mean, add_noise=False)      # (G, latent_dim)
 
         all_actions.append(actions)
-        all_log_probs.append(log_probs)
+        all_lp.append(log_probs)
 
-    # Stack: (G, T, chunk_size, action_dim)
-    all_actions   = torch.stack(all_actions,   dim=1)
-    all_log_probs = torch.stack(all_log_probs, dim=1)
+    all_actions = torch.stack(all_actions, dim=1)  # (G, T, chunk_size, action_dim)
+    all_lp      = torch.stack(all_lp,      dim=1)  # (G, T, chunk_size, action_dim)
+    return z, all_actions, all_lp
 
-    return z, all_actions, all_log_probs
+
+def recompute_log_probs(
+    policy: SWMPolicy,
+    z0: torch.Tensor,          # (G, latent_dim)
+    transition: SWMTransition,
+    all_actions: torch.Tensor, # (G, T, chunk_size, action_dim)
+    instruction: str,
+) -> torch.Tensor:
+    """
+    현재 policy θ로 log π_θ(a|s) 재계산.
+    GRPO ratio 계산에 필요.
+    """
+    G, T, chunk_size, action_dim = all_actions.shape
+    z = z0
+    new_lp_list = []
+
+    for t in range(T):
+        a_t = all_actions[:, t]                       # (G, chunk_size, action_dim)
+        lp  = policy.log_prob(z, instruction, a_t)   # (G, chunk_size, action_dim)
+        new_lp_list.append(lp)
+        with torch.no_grad():
+            a_mean = a_t.mean(dim=1)
+            z = transition(z, a_mean, add_noise=False)
+
+    return torch.stack(new_lp_list, dim=1)  # (G, T, chunk_size, action_dim)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="configs/stage3.yaml")
+    parser.add_argument("--config", default="configs/stage3.yaml")
     parser.add_argument("--debug",  action="store_true")
     args = parser.parse_args()
 
@@ -178,88 +160,115 @@ def main():
     log.info(f"Device: {device}")
 
     if not args.debug:
-        wandb.init(project="swm", name=cfg.experiment.name,
-                   config=OmegaConf.to_container(cfg))
+        import wandb
+        wandb.init(
+            project="swm",
+            name=cfg.experiment.name,
+            config=OmegaConf.to_container(cfg, resolve=True),
+        )
 
     # ── Frozen components ─────────────────────────────────────────────────────
     encoder, heads, transition = load_frozen_components(cfg, device)
 
-    # ── Policy ────────────────────────────────────────────────────────────────
-    policy     = PolicyWrapper(cfg, device).to(device)
-    policy_old = PolicyWrapper(cfg, device).to(device)
-    policy_old.load_state_dict(policy.state_dict())
+    # ── Policy (OpenVLA-OFT + V-JEPA-2) ──────────────────────────────────────
+    policy = SWMPolicy(
+        openvla_ckpt=cfg.policy.get("openvla_ckpt", None),
+        vjepa2_ckpt=cfg.policy.get("vjepa2_ac_ckpt", None),
+        freeze_siglip=cfg.policy.freeze_siglip,
+        freeze_vjepa2=cfg.policy.freeze_vjepa,
+        latent_dim=encoder.latent_dim,
+        action_dim=cfg.policy.action_dim,
+        action_chunk_size=cfg.policy.action_chunk_size,
+        use_peft=cfg.policy.use_peft,
+        peft_r=cfg.policy.peft_r,
+        peft_alpha=cfg.policy.peft_alpha,
+    ).to(device)
+
+    # π_θ_old: policy 복사본 (GRPO ratio 분모)
+    import copy
+    policy_old = copy.deepcopy(policy)
     for p in policy_old.parameters():
         p.requires_grad = False
+    policy_old.eval()
 
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, policy.parameters()),
         lr=cfg.training.lr,
+        weight_decay=cfg.training.weight_decay,
     )
     scaler = torch.cuda.amp.GradScaler(enabled=cfg.training.amp)
 
-    # ── Goal graphs from success trajectories ─────────────────────────────────
+    # ── Goal Graph Dataset (성공 trajectory 마지막 프레임) ─────────────────
     goal_ds = GoalGraphDataset(
-        success_traj_dir=cfg.data.success_traj_dir,
+        data_root=cfg.data.data_root,
         task=cfg.data.task,
+        max_nodes=8,
     )
-    log.info(f"Goal graphs: {len(goal_ds)}")
 
+    # ── Initial State Dataset ─────────────────────────────────────────────
+    init_ds = InitialStateDataset(
+        data_root=cfg.data.data_root,
+        task=cfg.data.task,
+        image_size=cfg.data.image_size,
+    )
+    init_loader = DataLoader(
+        init_ds, batch_size=1,
+        shuffle=True, num_workers=2,
+    )
+    init_iter = iter(init_loader)
+
+    # ── GRPO 하이퍼파라미터 ───────────────────────────────────────────────
     G           = cfg.grpo.G
     T           = cfg.grpo.T
     chunk_size  = cfg.policy.action_chunk_size
     temperature = cfg.grpo.sampling_temperature
-    max_nodes   = 8
+    instruction = f"pick and place square into peg"  # TODO: task별 instruction
 
-    # ── GRPO loop ──────────────────────────────────────────────────────────────
+    # ── GRPO loop ─────────────────────────────────────────────────────────
     best_reward = -float("inf")
+
     for iteration in range(1, cfg.training.iterations + 1):
 
-        # Sample a random initial state from the environment
-        # TODO: replace with real env.reset() → obs
-        # For now: random latent as stub
+        # ── 초기 상태 샘플링 ─────────────────────────────────────────────
+        try:
+            init_batch = next(init_iter)
+        except StopIteration:
+            init_iter = iter(init_loader)
+            init_batch = next(init_iter)
+
+        init_image = init_batch["image"].to(device)  # (1, 3, H, W)
+
         with torch.no_grad():
-            z0 = torch.randn(1, encoder.latent_dim, device=device)
-            z0_expanded = z0.expand(G, -1)            # (G, latent_dim)
+            # V-JEPA-2 encoder → z_0
+            z0_single = encoder(init_image)                    # (1, latent_dim)
+            z0 = z0_single.expand(G, -1).contiguous()         # (G, latent_dim)
 
-        # Sample goal graph (random from success set)
-        goal_idx = random.randint(0, len(goal_ds) - 1)
-        goal_graph = goal_ds[goal_idx].to(device)     # (max_nodes, 3)
-        node_mask = (goal_graph.abs().sum(-1) > 0)    # (max_nodes,)
+        # ── Goal graph 샘플링 ────────────────────────────────────────────
+        goal_graph = goal_ds.random_goal().to(device)          # (max_nodes, 3)
+        node_mask  = (goal_graph.abs().sum(-1) > 0)            # (max_nodes,)
 
-        instruction = "pick and place"  # TODO: load from dataset
-
-        # ── Imagined rollout ───────────────────────────────────────────────────
+        # ── Imagined rollout with π_θ_old ────────────────────────────────
         with torch.no_grad():
             z_T, all_actions, old_log_probs = imagined_rollout(
-                z0_expanded, policy_old, transition,
-                instruction, T, chunk_size, temperature
+                z0, policy_old, transition,
+                instruction, T, chunk_size, temperature, device
             )
             # z_T: (G, latent_dim)
 
-        # ── Reward: Graph distance ─────────────────────────────────────────────
+        # ── Dense reward: Graph distance ─────────────────────────────────
         with torch.no_grad():
-            graph_pred, _ = heads(z_T)   # (G, max_nodes, 3)
+            graph_pred, _ = heads(z_T)    # (G, max_nodes, 3)
             rewards = compute_graph_distance_reward(
                 graph_pred, goal_graph, node_mask,
-                temperature=cfg.grpo.reward_temperature
-            )  # (G,)
+                temperature=cfg.grpo.reward_temperature,
+            )  # (G,)  연속값, 가까울수록 0에 가까움
 
-        # ── Re-compute log probs under current policy ─────────────────────────
-        # all_actions: (G, T, chunk_size, action_dim)
-        # Reshape for log_prob computation
+        # ── Re-compute log probs under current policy π_θ ────────────────
         with torch.cuda.amp.autocast(enabled=cfg.training.amp):
-            z_t = z0_expanded.detach()
-            new_log_probs_list = []
-            for t in range(T):
-                a_t = all_actions[:, t]              # (G, chunk_size, action_dim)
-                lp = policy.log_prob(z_t, instruction, a_t)
-                new_log_probs_list.append(lp)
-                a_mean = a_t.mean(dim=1)
-                with torch.no_grad():
-                    z_t = transition(z_t, a_mean, training=False)
-
-            new_log_probs = torch.stack(new_log_probs_list, dim=1)
-            # (G, T, chunk_size, action_dim)
+            new_log_probs = recompute_log_probs(
+                policy, z0.detach(), transition,
+                all_actions, instruction
+            )  # (G, T, chunk_size, action_dim)
 
             loss, info = compute_grpo_loss(
                 log_probs=new_log_probs,
@@ -274,25 +283,33 @@ def main():
         optimizer.zero_grad()
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(policy.parameters(), cfg.training.grad_clip)
+        nn.utils.clip_grad_norm_(
+            filter(lambda p: p.requires_grad, policy.parameters()),
+            cfg.training.grad_clip
+        )
         scaler.step(optimizer)
         scaler.update()
 
-        # Sync old policy
+        # π_θ_old 동기화
         policy_old.load_state_dict(policy.state_dict())
 
+        # ── Logging ──────────────────────────────────────────────────────
         if iteration % cfg.training.log_interval == 0:
-            log.info(f"[Iter {iteration}]  "
-                     f"loss={info['loss/total']:.4f}  "
-                     f"reward_mean={info['reward/mean']:.4f}  "
-                     f"reward_max={info['reward/max']:.4f}")
-            wandb.log({**info, "iteration": iteration})
+            log.info(
+                f"[Iter {iteration:04d}]  "
+                f"loss={info['loss/total']:.4f}  "
+                f"reward_mean={info['reward/mean']:.4f}  "
+                f"reward_max={info['reward/max']:.4f}  "
+                f"clip_frac={info['ratio/clip_frac']:.3f}"
+            )
+            if not args.debug:
+                wandb.log({**info, "iteration": iteration})
 
+        # ── Checkpoint ───────────────────────────────────────────────────
         if iteration % cfg.training.save_interval == 0:
             torch.save({
-                "iteration": iteration,
-                "policy": policy.state_dict(),
-                "optimizer": optimizer.state_dict(),
+                "iteration":   iteration,
+                "policy":      policy.state_dict(),
                 "reward_mean": info["reward/mean"],
             }, out_dir / f"ckpt_iter{iteration:04d}.pt")
 
@@ -300,13 +317,13 @@ def main():
         if mean_r > best_reward:
             best_reward = mean_r
             torch.save({
-                "iteration": iteration,
-                "policy": policy.state_dict(),
+                "iteration":   iteration,
+                "policy":      policy.state_dict(),
                 "reward_mean": mean_r,
             }, out_dir / "best.pt")
-            log.info(f"  ✓ New best reward: {best_reward:.4f}")
+            log.info(f"  ★ New best reward={best_reward:.4f}")
 
-    log.info("Stage 3 complete.")
+    log.info(f"Stage 3 done.  Best reward={best_reward:.4f}")
 
 
 if __name__ == "__main__":

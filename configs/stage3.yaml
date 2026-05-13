@@ -1,60 +1,44 @@
-# configs/stage3.yaml
-# Stage 3: Policy Training (GRPO)
-
 experiment:
-  name: swm_stage3
+  name: swm_stage3_square
   seed: 42
-  output_dir: outputs/stage3
+  output_dir: outputs/stage3/square
 
 data:
-  dataset: mimicgen
   task: square
-  data_root: data/mimicgen
+  data_root: /NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO-JEPA/data
   image_size: 224
-  num_workers: 4
-  # Success trajectories for Goal Graph extraction
-  success_traj_dir: data/mimicgen/success_trajs
+  num_workers: 2
 
-stage1_ckpt: outputs/stage1/best.pt
-stage2_ckpt: outputs/stage2/best.pt
+stage1_ckpt: outputs/stage1/square/best.pt
+stage2_ckpt: outputs/stage2/square/best.pt
 
 policy:
-  backbone: openvla_oft        # openvla_oft | dit
-  openvla_ckpt: checkpoints/openvla_oft/model.pt
-  # Replace DINOv2 with V-JEPA-AC spatial encoder
-  replace_dino_with_vjepa: true
-  vjepa2_ac_ckpt: checkpoints/vjepa2_ac/predictor.pt
-  freeze_siglip: true          # keep SigLIP frozen
-  freeze_vjepa: false          # fine-tune V-JEPA spatial branch
+  openvla_ckpt: null          # OpenVLA-OFT checkpoint 경로
+  vjepa2_ac_ckpt: /home/dgist_shyo/.cache/torch/hub/checkpoints/vjepa2-ac-vitg.pt        # V-JEPA-2 encoder checkpoint (policy 내부용)
+  freeze_siglip: true         # SigLIP frozen (language alignment 보존)
+  freeze_vjepa: false         # V-JEPA-2 fine-tune
   action_dim: 7
-  action_chunk_size: 4         # K actions per chunk (32-step rollout with T=8)
+  action_chunk_size: 4        # 4 actions per chunk → T=8이면 32 step horizon
   use_peft: true
   peft_r: 16
   peft_alpha: 32
 
 grpo:
-  G: 8                         # number of trajectory samples per state
-  T: 8                         # rollout steps (T * chunk_size = total horizon)
-  # Reward: Graph distance (dense, continuous)
-  reward_type: graph_distance  # graph_distance | sparse_binary
-  reward_temperature: 1.0      # scale reward before advantage computation
-  # GRPO hyperparams
+  G: 8                        # trajectory 샘플 수
+  T: 8                        # rollout steps
+  reward_type: graph_distance
+  reward_temperature: 1.0
   clip_epsilon: 0.2
   kl_coef: 0.01
   entropy_coef: 0.001
   normalize_advantage: true
-  # Sampling diversity
   sampling_temperature: 1.0
-  top_p: 0.9
 
 training:
   iterations: 100
-  batch_size: 1                # one initial state per step
   lr: 1.0e-6
   weight_decay: 0.0
   grad_clip: 1.0
   amp: true
   log_interval: 10
   save_interval: 10
-  eval_interval: 10
-  eval_episodes: 50
