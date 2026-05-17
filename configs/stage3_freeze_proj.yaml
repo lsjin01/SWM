@@ -1,0 +1,46 @@
+# Stage 3 — SWMRewardModel Reward + LoRA only (projector frozen)
+#
+# 변경사항 (vs stage3_vs_p128_rm_lora.yaml):
+#   freeze_projector: true  → projector 고정, q/v LoRA만 학습
+#   이유: projector가 학습되면 vision feature 해석이 달라져 reward hacking 위험
+#         SWM encoder = native VB (DINOv2+SigLIP) 동일 → projector 재학습 불필요
+
+experiment:
+  name: swm_stage3_freeze_proj_square
+  seed: 42
+  output_dir: outputs/stage3/freeze_proj/square
+
+task: square
+unnorm_key: square_d0_300_demos
+
+reward_type: reward_model
+reward_model_ckpt: outputs/stage2_5_v2/square/best.pt
+
+reward_model:
+  latent_dim: 2176
+  hidden_dim: 512
+  n_layers: 3
+
+vla_path: /NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO/checkpoint_files/SFT_models/square
+swm_ckpt: outputs/stage2/multitask_dinosiglip/best.pt
+stage1_ckpt: outputs/stage1/multitask_dinosiglip/best.pt
+
+data_root: /NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO-JEPA/data
+
+training:
+  iterations: 200
+  max_demos: 300
+  n_states_per_iter: 4
+  g_rollouts: 8
+  mini_g: 2
+  n_rollout_chunks: 20
+  temperature: 1.2
+  full_finetune: false
+  freeze_projector: true        # projector frozen — q/v LoRA만 학습
+  gradient_checkpointing: false
+  lr: 5.0e-6
+  clip_eps: 0.2
+  kl_coef: 0.05
+  grad_clip: 1.0
+  log_every: 1
+  save_every: 20

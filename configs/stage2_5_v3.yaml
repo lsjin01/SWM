@@ -1,0 +1,31 @@
+experiment:
+  name: swm_stage2_5_v3_square
+  seed: 42
+  output_dir: outputs/stage2_5_v3/square
+
+task: square
+
+vla_path: /NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO/checkpoint_files/SFT_models/square
+stage1_ckpt: outputs/stage1/multitask_dinosiglip/best.pt
+stage2_ckpt: outputs/stage2/multitask_dinosiglip/best.pt
+data_root: /NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO-JEPA/data
+
+model:
+  latent_dim: 2176
+  hidden_dim: 256
+  n_frames: 8        # temporal window (WMPO 동일)
+  n_heads: 4
+  n_layers: 2
+  dropout: 0.0
+
+training:
+  epochs: 30
+  batch_size: 256
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  max_demos: 300
+  n_rollout_steps: 160
+  n_neg_per_demo: 4
+  n_pos_per_demo: 1
+  train_split: 0.9
+  save_every: 10

@@ -1,330 +1,749 @@
 #!/usr/bin/env python3
 # scripts/train_stage3.py
 """
-Stage 3: Policy Training (GRPO)
-================================
+Stage 3: GRPO Policy Optimization
+===================================
+SWM (DINOv2+SigLIP encoder + Small Transition) + OpenVLA-OFT
 
-전체 흐름:
-  1. image → V-JEPA-2 encoder → z_0  (초기 latent)
-  2. z_0 + instruction → OpenVLA-OFT → action_chunk_0  (non-AR, chunk 단위)
-  3. z_0 + action_mean_0 → Transition → z_1
-  4. z_1 + instruction → OpenVLA-OFT → action_chunk_1
-  5. ... T번 반복 → z_T
-  6. z_T → frozen Graph Head → Ĝ_T
-  7. Reward = -‖Ĝ_T − G*_T‖²  (dense, 별도 reward model 불필요)
-  8. GRPO → Policy(OpenVLA-OFT) 업데이트
+핵심 아이디어:
+  z_t (2176) → repeat(256) → projector → LLM → action tokens
+  action → Transition → z_t+1 → Graph Head → Ĝ_T
+  Reward = -‖Ĝ_T - G*_T‖  (goal graph distance)
 
-G개 trajectory 병렬 샘플링 → group-relative advantage
+기존 WMPO train_grpo_optionA.py의 구조를 SWM에 맞게 수정:
+  - decoder 제거 (z_t를 projector에 직접 주입)
+  - V-JEPA-AC → SWM Transition
+  - latent_reward → graph_reward
 """
 
-import sys
-import random
-import argparse
-import logging
+import os, sys, time, random, argparse, logging
 from pathlib import Path
+from typing import List
 
+import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributions import Categorical
 from omegaconf import OmegaConf
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, '/NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO-JEPA/dependencies/openvla-oft')
+sys.path.insert(0, '/NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO-JEPA')
 
-from models.encoder import SWMEncoder
-from models.heads import SWMHeads
+from models.encoder   import SWMEncoder
 from models.transition import SWMTransition
-from models.policy import SWMPolicy
-from data.dataset import GoalGraphDataset, InitialStateDataset
-from utils.grpo import compute_graph_distance_reward, compute_grpo_loss
+from models.heads     import SWMHeads
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)s  %(message)s"
-)
 log = logging.getLogger(__name__)
+
+def setup_ddp():
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    return local_rank
+
+def cleanup_ddp():
+    dist.destroy_process_group()
+
+def is_main():
+    return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Constants (OpenVLA-OFT)
+# ─────────────────────────────────────────────────────────────────────────────
+NUM_ACTIONS_CHUNK  = 8
+ACTION_DIM         = 7
+NUM_ACTION_TOKENS  = ACTION_DIM * NUM_ACTIONS_CHUNK   # 56
+NUM_VISION_TOKENS  = 256
+
+_TASK_DESC = {
+    "square":               "pick up the square nut and place it on the round peg",
+    "coffee":               "place the coffee pod into the coffee machine",
+    "stack_three":          "stack the three cubes on top of each other",
+    "three_piece_assembly": "assemble the three pieces together",
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# z_t → VLA forward (vision bypass)
+# ─────────────────────────────────────────────────────────────────────────────
 
-def load_frozen_components(cfg, device):
-    """Stage 1, 2 체크포인트 로드 후 freeze."""
-    # Encoder + Heads (Stage 1)
-    encoder = SWMEncoder(latent_dim=cfg.get("latent_dim", 1024)).to(device)
-    heads   = SWMHeads(latent_dim=encoder.latent_dim).to(device)
-    s1 = torch.load(cfg.stage1_ckpt, map_location=device)
-    encoder.load_state_dict(s1["encoder"])
-    heads.load_state_dict(s1["heads"])
+def image_to_patch_embeddings(
+    image: torch.Tensor,
+    encoder: 'SWMEncoder',
+    vla,
+) -> torch.Tensor:
+    """
+    image (B, 3, H, W) → projected spatial patch embeddings (B, 256, 4096)
 
-    # Transition (Stage 2)
-    transition = SWMTransition(
-        latent_dim=encoder.latent_dim,
-        action_dim=cfg.policy.action_dim,
-    ).to(device)
-    s2 = torch.load(cfg.stage2_ckpt, map_location=device)
-    transition.load_state_dict(s2["transition"])
+    encoder.encode_spatial() → (B, 256, 2176) 공간 patch features
+    → projector → (B, 256, 4096)
 
-    for m in [encoder, heads, transition]:
-        for p in m.parameters(): p.requires_grad = False
-        m.eval()
+    ▸ 각 256개 token이 서로 다른 공간 정보를 보존 (mean pool 제거)
+    ▸ train/eval 파이프라인 완전 일치
+    """
+    dtype = next(vla.projector.parameters()).dtype
+    spatial = encoder.encode_spatial(image).to(dtype)   # (B, 256, 2176)
+    return vla.projector(spatial)                        # (B, 256, 4096)
 
-    log.info("Frozen: Encoder, Heads, Transition")
-    return encoder, heads, transition
+
+def _vla_forward_patch_embeds(
+    patch_embeds: torch.Tensor,
+    prompt_ids: torch.Tensor,
+    attn_mask: torch.Tensor,
+    vla,
+    device: torch.device,
+    dtype: torch.dtype,
+    temperature: float,
+):
+    """patch_embeds (1, 256, 4096) + prompt → (tids (1,56), logprob float)"""
+    input_ids_ext = prompt_ids.clone()
+    placeholder   = torch.ones((1, NUM_ACTION_TOKENS), device=device, dtype=input_ids_ext.dtype)
+    stop          = torch.ones((1, 1),                  device=device, dtype=input_ids_ext.dtype) * 2
+    input_ids_full = torch.cat([input_ids_ext, placeholder, stop], dim=-1)
+
+    input_embeds = vla.get_input_embeddings()(input_ids_full)
+    full_embeds  = torch.cat([patch_embeds, input_embeds], dim=1)
+
+    vis_mask  = torch.ones((1, NUM_VISION_TOKENS),        device=device, dtype=attn_mask.dtype)
+    ext_mask  = torch.ones((1, input_ids_full.shape[1]),  device=device, dtype=attn_mask.dtype)
+    full_mask = torch.cat([vis_mask, ext_mask], dim=1)
+
+    out    = vla.language_model(inputs_embeds=full_embeds, attention_mask=full_mask, use_cache=False)
+    logits = out.logits[:, -NUM_ACTION_TOKENS-2:-2]  # (1, 56, V)  off-by-one fix
+    if temperature != 1.0:
+        logits = logits / temperature
+    dist = Categorical(logits=logits.reshape(-1, logits.size(-1)).float())
+    tids = dist.sample().reshape(1, -1)
+    lp   = dist.log_prob(tids.reshape(-1)).sum().item()
+    return tids, lp
+
+
+def swm_rollout(
+    z0: torch.Tensor,           # (1, 2176)  global latent (transition / reward 전용)
+    image0: torch.Tensor,       # (1, 3, H, W)  초기 관측 이미지 (VLA spatial 인코딩용)
+    encoder: 'SWMEncoder',
+    transition: 'SWMTransition',
+    heads: 'SWMHeads',
+    vla,
+    processor,
+    prompt_ids: torch.Tensor,
+    attn_mask: torch.Tensor,
+    tokens_to_actions,
+    n_chunks: int,
+    temperature: float,
+    device: torch.device,
+    dtype: torch.dtype,
+):
+    """
+    수정된 SWM rollout:
+      - VLA: 초기 관측 image의 spatial patch features → projector → LLM
+             (256개 token 각자 다른 공간 정보 → train/eval 완전 일치)
+      - WM:  global z_t → transition → z_t+1 (reward 계산 전용)
+
+    Returns:
+        token_ids_list : list[Tensor(56,)]   각 chunk의 action tokens
+        logprobs_list  : list[float]          log-probabilities
+        patch_embeds_cpu: Tensor(1, 256, 4096) CPU (gradient recompute용)
+        z_history      : list[Tensor(1, 2176)]  WM latent history
+    """
+    z = z0.clone().to(device, dtype)
+
+    # ── 초기 이미지 → spatial patch embeddings (한 번만 계산) ────────────
+    with torch.no_grad():
+        patch_embeds = image_to_patch_embeddings(image0, encoder, vla)  # (1, 256, 4096)
+
+    patch_embeds_cpu = patch_embeds.cpu()   # gradient recompute용 CPU 저장
+
+    token_ids_list = []
+    logprobs_list  = []
+    z_history      = []
+
+    for _ in range(n_chunks):
+        # ── VLA: 동일한 spatial patch_embeds 사용 ─────────────────────────
+        with torch.no_grad():
+            tids, lp = _vla_forward_patch_embeds(
+                patch_embeds, prompt_ids, attn_mask, vla, device, dtype, temperature
+            )
+
+        token_ids_list.append(tids[0].cpu())
+        logprobs_list.append(lp)
+
+        # ── WM: global z_t + action → z_t+1 (reward 전용) ────────────────
+        actions = tokens_to_actions(tids)  # (1, 8, 7)
+        with torch.no_grad():
+            for sub in range(NUM_ACTIONS_CHUNK):
+                a = actions[0, sub].float().to(device)
+                z = transition(z.float(), a.unsqueeze(0)).to(dtype)
+                z_history.append(z.clone())
+
+    return token_ids_list, logprobs_list, patch_embeds_cpu, z_history
+
+
+def recompute_logprobs_grad(
+    patch_embeds_cpu: torch.Tensor,   # (1, 256, 4096)  공유 spatial embeddings
+    token_ids_list: list,             # list of (56,) Tensor
+    vla,
+    prompt_ids: torch.Tensor,
+    attn_mask: torch.Tensor,
+    device: torch.device,
+    dtype: torch.dtype,
+):
+    """
+    gradient 있는 log-prob 재계산 (GRPO backward용).
+    모든 chunk가 같은 patch_embeds를 공유 → 한 번만 GPU로 이동.
+    """
+    patch_embeds = patch_embeds_cpu.to(device, dtype)
+
+    input_ids_ext  = prompt_ids.clone()
+    placeholder    = torch.ones((1, NUM_ACTION_TOKENS), device=device, dtype=input_ids_ext.dtype)
+    stop           = torch.ones((1, 1),                  device=device, dtype=input_ids_ext.dtype) * 2
+    input_ids_full = torch.cat([input_ids_ext, placeholder, stop], dim=-1)
+
+    input_embeds   = vla.get_input_embeddings()(input_ids_full)
+    full_embeds    = torch.cat([patch_embeds, input_embeds], dim=1)
+
+    vis_mask  = torch.ones((1, NUM_VISION_TOKENS),        device=device, dtype=attn_mask.dtype)
+    ext_mask  = torch.ones((1, input_ids_full.shape[1]),  device=device, dtype=attn_mask.dtype)
+    full_mask = torch.cat([vis_mask, ext_mask], dim=1)
+
+    out    = vla.language_model(inputs_embeds=full_embeds, attention_mask=full_mask, use_cache=False)
+    logits = out.logits[:, -NUM_ACTION_TOKENS-2:-2]  # (1, 56, V)  off-by-one fix
+
+    lp_list = []
+    for tids in token_ids_list:
+        tgt = tids.to(device)
+        lp  = -F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)).float(),
+            tgt.reshape(-1),
+            reduction='sum',
+        )
+        lp_list.append(lp)
+    return lp_list
+
+
+def grpo_loss_fn(lp_new_list, lp_old_list, advantages, clip_eps, kl_coef):
+    losses = []
+    for lp_new, lp_old, adv in zip(lp_new_list, lp_old_list, advantages):
+        ratio = torch.exp(lp_new - lp_old)
+        adv_t = torch.tensor(adv, device=lp_new.device, dtype=lp_new.dtype)
+        surr  = -torch.min(
+            ratio * adv_t,
+            torch.clamp(ratio, 1-clip_eps, 1+clip_eps) * adv_t
+        )
+        if kl_coef > 0:
+            surr = surr + kl_coef * (lp_old - lp_new)
+        losses.append(surr)
+    return torch.stack(losses).mean()
 
 
 @torch.no_grad()
-def imagined_rollout(
-    z0: torch.Tensor,          # (G, latent_dim)
-    policy: SWMPolicy,
-    transition: SWMTransition,
-    instruction: str,
-    T: int,
-    chunk_size: int,
-    temperature: float,
-    device,
-):
+def graph_reward(z_history, heads, goal_pos, device):
     """
-    T번 반복:
-      z_t → Policy → action_chunk_t (non-AR)
-      z_t + action_mean_t → Transition → z_t+1 (AR)
+    Reward = -‖Ĝ_T - G*_T‖   (goal graph distance)
+    z_history: list of (1, 2176) latents
+    goal_pos:  (N, 3) goal node positions
+    """
+    if len(z_history) == 0:
+        return 0.0
+
+    z_final = z_history[-1].float().to(device)
+    raw_heads = heads.module if hasattr(heads, 'module') else heads
+    graph_pred, _ = raw_heads(z_final)  # (1, max_nodes, 3)
+
+    N = goal_pos.shape[0]
+    pred = graph_pred[0, :N]
+    goal = goal_pos.to(device, torch.float32)
+    dist = (pred - goal).norm(dim=-1).mean().item()
+    return -dist   # reward는 distance의 음수
+
+
+@torch.no_grad()
+def transition_l2_reward(z_history, z_goal_transition, device):
+    """
+    Reward = -||z_T_policy - z_goal_demo||_2   (둘 다 transition 공간)
+    z_history:         list of (1, 2176) — policy rollout via transition
+    z_goal_transition: (1, 2176) — demo actions 64스텝을 transition으로 돌린 끝 latent
+    → encoder vs transition 분포 불일치 없음
+    """
+    if len(z_history) == 0:
+        return 0.0
+    z_final = z_history[-1].float().to(device)
+    z_g     = z_goal_transition.float().to(device)
+    return -(z_final - z_g).norm(dim=-1).mean().item()
+
+
+@torch.no_grad()
+def latent_reward(z_history, z_goal, device, metric='cosine', z_init=None):
+    """
+    Reward = mean over trajectory of normalized cosine progress toward goal.
+
+    For each z_t in z_history:
+      progress_t = (cos(z_t, z_goal) - cos(z_init, z_goal)) / (1 - cos(z_init, z_goal))
+    reward = mean(progress_t)
+
+    This rewards consistent progress throughout the trajectory,
+    not just the final state.
+    """
+    if len(z_history) == 0:
+        return 0.0
+    z_g = z_goal.float().to(device)
+    if metric == 'cosine':
+        if z_init is not None:
+            cos_0 = F.cosine_similarity(z_init.float().to(device), z_g).mean().item()
+            denom = max(1.0 - cos_0, 1e-4)
+            progresses = []
+            for z_t in z_history:
+                cos_t = F.cosine_similarity(z_t.float().to(device), z_g).mean().item()
+                progresses.append((cos_t - cos_0) / denom)
+            return float(sum(progresses) / len(progresses))
+        z_final = z_history[-1].float().to(device)
+        return F.cosine_similarity(z_final, z_g).mean().item()
+    else:
+        z_final = z_history[-1].float().to(device)
+        return -(z_final - z_g).norm(dim=-1).mean().item()
+
+
+@torch.no_grad()
+def reward_model_reward(z_history, z_goal, reward_model, device):
+    """
+    Temporal Transformer reward: sample_traj(z_history) → SWMRewardModel → P(success)
+    z_history: list of (1, 2176) latents from WM transition
+    z_goal:    unused (kept for API compatibility)
+    """
+    from models.reward_model import sample_traj
+    if len(z_history) == 0:
+        return 0.0
+    n_frames = reward_model.n_frames
+    z_traj = sample_traj(z_history, n_frames).float().to(device)  # (1, T, 2176)
+    return reward_model.reward(z_traj)
+
+
+@torch.no_grad()
+def load_initial_states(demo_dir, task, encoder, max_demos, device, dtype,
+                        reward_type='graph', transition=None, rollout_steps=64):
+    """
+    데모 첫 프레임을 인코딩.
 
     Returns:
-      z_T:        (G, latent_dim)  최종 latent
-      all_actions:(G, T, chunk_size, action_dim)
-      all_lp:     (G, T, chunk_size, action_dim)
+        init_images  : list of (1, 3, H, W) CPU float tensor  (VLA spatial 인코딩용)
+        init_latents : list of (1, 2176) CPU tensor            (WM transition 시작점)
+        init_goals   : list — content depends on reward_type:
+                       'graph'          → list of (N, 3) object position tensors
+                       'latent'         → list of (1, 2176) encoder(last_frame) latents
+                       'reward_model'   → list of (1, 2176) encoder(last_frame) latents
+                       'transition_l2'  → list of (1, 2176) transition(z0, demo_actions[:rollout_steps])
     """
-    z = z0
-    all_actions = []
-    all_lp      = []
+    import h5py
+    from torchvision import transforms
 
-    for t in range(T):
-        # Policy: z_t → action chunk (non-AR)
-        actions, log_probs = policy.sample(
-            z, instruction,
-            chunk_size=chunk_size,
-            temperature=temperature,
-        )
-        # actions: (G, chunk_size, action_dim)
+    hdf5 = os.path.join(
+        demo_dir, 'demos', 'core_datasets', task,
+        f'demo_src_{task}_task_D0', 'demo.hdf5'
+    )
+    transform = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        # Normalize는 encoder 내부에서 backbone별로 적용
+    ])
 
-        # Transition: z_t + mean(action) → z_t+1
-        a_mean = actions.mean(dim=1)                    # (G, action_dim)
-        z = transition(z, a_mean, add_noise=False)      # (G, latent_dim)
+    init_images  = []
+    init_latents = []
+    init_goals   = []
 
-        all_actions.append(actions)
-        all_lp.append(log_probs)
+    with h5py.File(hdf5, 'r') as f:
+        demos = sorted(f['data'].keys())[:max_demos]
+        for dn in demos:
+            img_np    = f[f'data/{dn}/obs/agentview_image'][0]
+            image_t   = transform(img_np).unsqueeze(0)
+            image_gpu = image_t.to(device)
+            z = encoder(image_gpu).to(dtype)
 
-    all_actions = torch.stack(all_actions, dim=1)  # (G, T, chunk_size, action_dim)
-    all_lp      = torch.stack(all_lp,      dim=1)  # (G, T, chunk_size, action_dim)
-    return z, all_actions, all_lp
+            init_images.append(image_t.cpu())
+            init_latents.append(z.cpu())
 
+            if reward_type == 'transition_l2':
+                # demo actions를 transition으로 rollout → z_goal도 transition 공간
+                demo_actions = f[f'data/{dn}/actions'][:]      # (T, 7) raw actions
+                n_steps = min(rollout_steps, len(demo_actions))
+                z_t = z.clone()
+                for t in range(n_steps):
+                    a = torch.from_numpy(demo_actions[t]).float().to(device).unsqueeze(0)
+                    z_t = transition(z_t.float(), a).to(dtype)
+                init_goals.append(z_t.cpu())
 
-def recompute_log_probs(
-    policy: SWMPolicy,
-    z0: torch.Tensor,          # (G, latent_dim)
-    transition: SWMTransition,
-    all_actions: torch.Tensor, # (G, T, chunk_size, action_dim)
-    instruction: str,
-) -> torch.Tensor:
-    """
-    현재 policy θ로 log π_θ(a|s) 재계산.
-    GRPO ratio 계산에 필요.
-    """
-    G, T, chunk_size, action_dim = all_actions.shape
-    z = z0
-    new_lp_list = []
+            elif reward_type in ('latent', 'reward_model'):
+                goal_np = f[f'data/{dn}/obs/agentview_image'][-1]
+                goal_t  = transform(goal_np).unsqueeze(0).to(device)
+                z_goal  = encoder(goal_t).to(dtype)
+                init_goals.append(z_goal.cpu())
 
-    for t in range(T):
-        a_t = all_actions[:, t]                       # (G, chunk_size, action_dim)
-        lp  = policy.log_prob(z, instruction, a_t)   # (G, chunk_size, action_dim)
-        new_lp_list.append(lp)
-        with torch.no_grad():
-            a_mean = a_t.mean(dim=1)
-            z = transition(z, a_mean, add_noise=False)
+            else:  # 'graph'
+                obj = f[f'data/{dn}/obs/object'][-1]
+                from data.dataset import parse_object_positions
+                pos = parse_object_positions(obj, task)
+                init_goals.append(torch.from_numpy(pos))
 
-    return torch.stack(new_lp_list, dim=1)  # (G, T, chunk_size, action_dim)
+    log.info(f"[init_states] {task}: {len(init_latents)} demos encoded  reward_type={reward_type}")
+    return init_images, init_latents, init_goals
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument('--config',           default='configs/stage3.yaml')
+    p.add_argument('--no-wandb',         action='store_true')
+    p.add_argument('--resume',           type=str, default=None)
+    p.add_argument('--debug',            action='store_true')
+    return p.parse_args()
+
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/stage3.yaml")
-    parser.add_argument("--debug",  action="store_true")
-    args = parser.parse_args()
+    args = parse_args()
+    cfg  = OmegaConf.load(args.config)
 
-    cfg     = OmegaConf.load(args.config)
     out_dir = Path(cfg.experiment.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    torch.manual_seed(cfg.experiment.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log.info(f"Device: {device}")
-
-    if not args.debug:
-        import wandb
-        wandb.init(
-            project="swm",
-            name=cfg.experiment.name,
-            config=OmegaConf.to_container(cfg, resolve=True),
+    if is_main():
+        out_dir.mkdir(parents=True, exist_ok=True)
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s  %(levelname)s  %(message)s",
+            handlers=[
+                logging.StreamHandler(),
+                logging.FileHandler(
+                    out_dir / 'train.log',
+                    mode='a' if args.resume else 'w'
+                ),
+            ]
         )
+    else:
+        logging.basicConfig(level=logging.WARNING)
 
-    # ── Frozen components ─────────────────────────────────────────────────────
-    encoder, heads, transition = load_frozen_components(cfg, device)
-
-    # ── Policy (OpenVLA-OFT + V-JEPA-2) ──────────────────────────────────────
-    policy = SWMPolicy(
-        openvla_ckpt=cfg.policy.get("openvla_ckpt", None),
-        vjepa2_ckpt=cfg.policy.get("vjepa2_ac_ckpt", None),
-        freeze_siglip=cfg.policy.freeze_siglip,
-        freeze_vjepa2=cfg.policy.freeze_vjepa,
-        latent_dim=encoder.latent_dim,
-        action_dim=cfg.policy.action_dim,
-        action_chunk_size=cfg.policy.action_chunk_size,
-        use_peft=cfg.policy.use_peft,
-        peft_r=cfg.policy.peft_r,
-        peft_alpha=cfg.policy.peft_alpha,
-    ).to(device)
-
-    # π_θ_old: policy 복사본 (GRPO ratio 분모)
-    import copy
-    policy_old = copy.deepcopy(policy)
-    for p in policy_old.parameters():
-        p.requires_grad = False
-    policy_old.eval()
-
-    optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, policy.parameters()),
-        lr=cfg.training.lr,
-        weight_decay=cfg.training.weight_decay,
-    )
-    scaler = torch.cuda.amp.GradScaler(enabled=cfg.training.amp)
-
-    # ── Goal Graph Dataset (성공 trajectory 마지막 프레임) ─────────────────
-    goal_ds = GoalGraphDataset(
-        data_root=cfg.data.data_root,
-        task=cfg.data.task,
-        max_nodes=8,
-    )
-
-    # ── Initial State Dataset ─────────────────────────────────────────────
-    init_ds = InitialStateDataset(
-        data_root=cfg.data.data_root,
-        task=cfg.data.task,
-        image_size=cfg.data.image_size,
-    )
-    init_loader = DataLoader(
-        init_ds, batch_size=1,
-        shuffle=True, num_workers=2,
-    )
-    init_iter = iter(init_loader)
-
-    # ── GRPO 하이퍼파라미터 ───────────────────────────────────────────────
-    G           = cfg.grpo.G
-    T           = cfg.grpo.T
-    chunk_size  = cfg.policy.action_chunk_size
-    temperature = cfg.grpo.sampling_temperature
-    instruction = f"pick and place square into peg"  # TODO: task별 instruction
-
-    # ── GRPO loop ─────────────────────────────────────────────────────────
-    best_reward = -float("inf")
-
-    for iteration in range(1, cfg.training.iterations + 1):
-
-        # ── 초기 상태 샘플링 ─────────────────────────────────────────────
+    use_ddp = "LOCAL_RANK" in os.environ
+    if use_ddp:
+        local_rank = setup_ddp()
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        local_rank = 0
+    dtype  = torch.bfloat16
+    if is_main():
+        log.info(f"Device: {device}  DDP: {use_ddp}  dtype: {dtype}")
+        latest = out_dir.parent / 'latest'
         try:
-            init_batch = next(init_iter)
-        except StopIteration:
-            init_iter = iter(init_loader)
-            init_batch = next(init_iter)
+            latest.unlink()
+        except FileNotFoundError:
+            pass
+        try:
+            latest.symlink_to(out_dir.name)
+        except FileExistsError:
+            pass
 
-        init_image = init_batch["image"].to(device)  # (1, 3, H, W)
+    # ── Load SWM ─────────────────────────────────────────────────────────────
+    log.info("Loading SWM checkpoints ...")
+    # Stage 2: transition
+    s2_ckpt = torch.load(cfg.swm_ckpt, map_location=device)
+    s2_cfg  = OmegaConf.create(s2_ckpt.get('cfg', {}))
+    # Stage 1: encoder + heads
+    s1_ckpt = torch.load(cfg.stage1_ckpt, map_location=device)
+    s1_cfg  = OmegaConf.create(s1_ckpt.get('cfg', {}))
 
-        with torch.no_grad():
-            # V-JEPA-2 encoder → z_0
-            z0_single = encoder(init_image)                    # (1, latent_dim)
-            z0 = z0_single.expand(G, -1).contiguous()         # (G, latent_dim)
+    encoder = SWMEncoder(
+        vla_path=cfg.vla_path,
+        freeze_backbone=True,
+        latent_dim=2176,
+    ).to(device)
+    encoder.load_state_dict(s1_ckpt['encoder'])
 
-        # ── Goal graph 샘플링 ────────────────────────────────────────────
-        goal_graph = goal_ds.random_goal().to(device)          # (max_nodes, 3)
-        node_mask  = (goal_graph.abs().sum(-1) > 0)            # (max_nodes,)
+    transition = SWMTransition(
+        latent_dim=2176,
+        action_dim=7,
+        hidden_dim=s2_cfg.get('transition', {}).get('hidden_dim', 512),
+        num_layers=s2_cfg.get('transition', {}).get('num_layers', 6),
+        num_heads =s2_cfg.get('transition', {}).get('num_heads',  8),
+    ).to(device)
+    transition.load_state_dict(s2_ckpt['transition'])
 
-        # ── Imagined rollout with π_θ_old ────────────────────────────────
-        with torch.no_grad():
-            z_T, all_actions, old_log_probs = imagined_rollout(
-                z0, policy_old, transition,
-                instruction, T, chunk_size, temperature, device
-            )
-            # z_T: (G, latent_dim)
+    heads = SWMHeads(
+        latent_dim=2176,
+        max_nodes=s1_cfg.get('encoder', {}).get('max_nodes', 8),
+    ).to(device)
+    heads.load_state_dict(s1_ckpt['heads'])
 
-        # ── Dense reward: Graph distance ─────────────────────────────────
-        with torch.no_grad():
-            graph_pred, _ = heads(z_T)    # (G, max_nodes, 3)
-            rewards = compute_graph_distance_reward(
-                graph_pred, goal_graph, node_mask,
-                temperature=cfg.grpo.reward_temperature,
-            )  # (G,)  연속값, 가까울수록 0에 가까움
+    # freeze encoder, transition, heads
+    for m in [encoder, transition, heads]:
+        for p in m.parameters():
+            p.requires_grad = False
 
-        # ── Re-compute log probs under current policy π_θ ────────────────
-        with torch.cuda.amp.autocast(enabled=cfg.training.amp):
-            new_log_probs = recompute_log_probs(
-                policy, z0.detach(), transition,
-                all_actions, instruction
-            )  # (G, T, chunk_size, action_dim)
+    encoder.eval(); transition.eval(); heads.eval()
+    log.info("SWM loaded (frozen)")
 
-            loss, info = compute_grpo_loss(
-                log_probs=new_log_probs,
-                old_log_probs=old_log_probs,
-                rewards=rewards,
-                clip_epsilon=cfg.grpo.clip_epsilon,
-                kl_coef=cfg.grpo.kl_coef,
-                entropy_coef=cfg.grpo.entropy_coef,
-                normalize_advantage=cfg.grpo.normalize_advantage,
-            )
+    # ── Load VLA ─────────────────────────────────────────────────────────────
+    log.info(f"Loading VLA from {cfg.vla_path} ...")
+    from transformers import AutoModelForVision2Seq, AutoProcessor
+    from verl.utils.openvla_utils import update_auto_map
 
-        optimizer.zero_grad()
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        nn.utils.clip_grad_norm_(
-            filter(lambda p: p.requires_grad, policy.parameters()),
-            cfg.training.grad_clip
+    # rank 0만 config.json 수정 → 나머지 rank는 barrier 후 읽기
+    if not use_ddp or dist.get_rank() == 0:
+        update_auto_map(cfg.vla_path)
+    if use_ddp:
+        dist.barrier()
+    vla = AutoModelForVision2Seq.from_pretrained(
+        cfg.vla_path, torch_dtype=dtype,
+        trust_remote_code=True,
+        local_files_only=True,
+        low_cpu_mem_usage=True,
+    ).to(device)
+    processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
+
+    # full fine-tune (p128-style) or LoRA-only (q/v_proj, projector optionally frozen)
+    full_finetune    = cfg.training.get('full_finetune', False)
+    freeze_projector = cfg.training.get('freeze_projector', True)
+    if full_finetune:
+        for p in vla.parameters():
+            p.requires_grad = True
+        if cfg.training.get('gradient_checkpointing', False):
+            try:
+                vla.gradient_checkpointing_enable()
+                if is_main():
+                    log.info("gradient_checkpointing enabled")
+            except Exception as e:
+                if is_main():
+                    log.warning(f"gradient_checkpointing failed: {e}")
+    else:
+        for p in vla.parameters():
+            p.requires_grad = False
+        if not freeze_projector:
+            for p in vla.projector.parameters():
+                p.requires_grad = True
+        for name, p in vla.language_model.named_parameters():
+            if 'q_proj' in name or 'v_proj' in name:
+                p.requires_grad = True
+
+    n_total = sum(p.numel() for p in vla.parameters())
+    n_trainable = sum(p.numel() for p in vla.parameters() if p.requires_grad)
+    if is_main():
+        log.info(f"VLA trainable: {n_trainable/1e9:.2f}B / total {n_total/1e9:.2f}B  full_finetune={full_finetune}")
+
+    vla_raw = vla
+
+    # action codec
+    from data.dataset import TASK_OBJECT_CONFIG
+    task = cfg.task
+    unnorm_key = cfg.get('unnorm_key', task)
+
+    if unnorm_key not in vla_raw.norm_stats:
+        import json
+        ds_stats = json.load(open(Path(cfg.vla_path) / 'dataset_statistics.json'))
+        vla_raw.norm_stats.update(ds_stats)
+
+    stats = vla_raw.norm_stats[unnorm_key]['action']
+    q01 = torch.tensor(stats['q01'], device=device, dtype=torch.float32)
+    q99 = torch.tensor(stats['q99'], device=device, dtype=torch.float32)
+    n_bins = vla_raw.bin_centers.shape[0] + 1
+    vocab_size = vla_raw.vocab_size
+
+    def tokens_to_actions(tids):
+        """(1, 56) vocab token ids → (1, 8, 7) continuous actions"""
+        tids = tids.to(device)
+        # action tokens occupy the last n_bins-1 vocab IDs (highest IDs)
+        bin_idx = (vocab_size - tids - 1).clamp(0, n_bins - 2)
+        norm = (bin_idx.float() / (n_bins - 1)) * 2.0 - 1.0   # [-1, 1]
+        norm = norm.reshape(1, NUM_ACTIONS_CHUNK, ACTION_DIM)
+        acts = (norm + 1.0) / 2.0 * (q99 - q01) + q01
+        return acts
+
+    # ── Prompt (text-only tokenization — image tokens은 patch_embeds로 직접 주입) ──
+    task_desc = _TASK_DESC.get(task, task)
+    prompt    = f"In: What action should the robot take to {task_desc}?\nOut:"
+    feat      = processor.tokenizer(prompt, return_tensors='pt')
+    p_ids     = feat['input_ids'].to(device)
+    a_mask    = feat['attention_mask'].to(device)
+
+    # ── Initial states (images + global latents + goals) ─────────────────────
+    reward_type = cfg.get('reward_type', 'graph')
+    reward_metric = cfg.get('reward_metric', 'cosine')
+    if is_main():
+        log.info(f"Pre-encoding initial states ...  reward_type={reward_type}")
+    # transition_l2: rollout_steps = n_rollout_chunks × NUM_ACTIONS_CHUNK
+    rollout_steps = cfg.training.n_rollout_chunks * NUM_ACTIONS_CHUNK
+    init_images, init_latents, init_goals = load_initial_states(
+        cfg.data_root, task, encoder, cfg.training.max_demos, device, dtype,
+        reward_type=reward_type,
+        transition=transition,
+        rollout_steps=rollout_steps,
+    )
+
+    # ── Reward model 로딩 (reward_type='reward_model'일 때만) ─────────────────
+    rm = None
+    if reward_type == 'reward_model':
+        from models.reward_model import SWMRewardModel
+        rm_ckpt_path = cfg.get('reward_model_ckpt',
+                                f'outputs/stage2_5/{task}/best.pt')
+        rm_ckpt = torch.load(rm_ckpt_path, map_location=device, weights_only=False)
+        rm = SWMRewardModel(
+            latent_dim=cfg.get('reward_model', {}).get('latent_dim', 2176),
+            hidden_dim=cfg.get('reward_model', {}).get('hidden_dim', 512),
+            n_layers  =cfg.get('reward_model', {}).get('n_layers', 3),
+        ).to(device)
+        rm.load_state_dict(rm_ckpt['reward_model'])
+        rm.eval()
+        for p in rm.parameters():
+            p.requires_grad = False
+        if is_main():
+            log.info(f"RewardModel loaded from {rm_ckpt_path}  (frozen)")
+
+    # ── DDP 감싸기 ────────────────────────────────────────────────────────────
+    if use_ddp:
+        vla = DDP(vla, device_ids=[local_rank], find_unused_parameters=True)
+
+    # ── Optimizer ─────────────────────────────────────────────────────────────
+    trainable = [p for p in vla_raw.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(
+        trainable, lr=cfg.training.lr, weight_decay=0.01
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=cfg.training.iterations, eta_min=cfg.training.lr * 0.1
+    )
+
+    # ── Resume ────────────────────────────────────────────────────────────────
+    start_iter  = 1
+    best_reward = -float('inf')
+
+    if args.resume and Path(args.resume).exists():
+        ckpt_r = torch.load(args.resume, map_location=device)
+        vla_raw.load_state_dict(ckpt_r['vla'])
+        start_iter  = ckpt_r.get('iteration', 0) + 1
+        best_reward = ckpt_r.get('reward_mean', -float('inf'))
+        log.info(f"Resumed from {args.resume}  iter={start_iter-1}  reward={best_reward:.4f}")
+
+    use_wandb = not args.no_wandb and not args.debug
+    if use_wandb:
+        import wandb
+        wandb.init(project='swm', name=cfg.experiment.name,
+                   config=OmegaConf.to_container(cfg, resolve=True))
+
+    rng = random.Random(cfg.experiment.seed)
+
+    # ── GRPO loop ─────────────────────────────────────────────────────────────
+    log.info(f"\n[GRPO] {cfg.training.iterations} iterations  "
+             f"task={task}  g_rollouts={cfg.training.g_rollouts}")
+
+    for iteration in range(start_iter, cfg.training.iterations + 1):
+        z0_batch = rng.sample(
+            list(range(len(init_latents))),
+            min(cfg.training.n_states_per_iter, len(init_latents))
         )
-        scaler.step(optimizer)
-        scaler.update()
+        iter_rewards = []
+        iter_loss_sum = 0.0
+        optimizer.zero_grad()
 
-        # π_θ_old 동기화
-        policy_old.load_state_dict(policy.state_dict())
+        for z0_idx in z0_batch:
+            z0     = init_latents[z0_idx].to(device, dtype)   # global latent (WM용)
+            image0 = init_images[z0_idx].to(device)            # 관측 이미지 (VLA spatial용)
+            goal   = init_goals[z0_idx]
 
-        # ── Logging ──────────────────────────────────────────────────────
-        if iteration % cfg.training.log_interval == 0:
+            group_rewards = []
+            group_data    = []   # (tids_ep, lp_ep, patch_embeds_cpu) 저장
+
+            for _ in range(cfg.training.g_rollouts):
+                tids_ep, lp_ep, patch_embeds_cpu, z_hist = swm_rollout(
+                    z0, image0, encoder, transition, heads,
+                    vla_raw, processor, p_ids, a_mask,
+                    tokens_to_actions,
+                    cfg.training.n_rollout_chunks,
+                    cfg.training.temperature,
+                    device, dtype,
+                )
+                if reward_type == 'transition_l2':
+                    rew = transition_l2_reward(z_hist, goal, device)
+                elif reward_type == 'latent':
+                    rew = latent_reward(z_hist, goal, device, metric=reward_metric,
+                                        z_init=z0.cpu() if reward_metric == 'cosine' else None)
+                elif reward_type == 'reward_model':
+                    rew = reward_model_reward(z_hist, goal, rm, device)
+                else:
+                    rew = graph_reward(z_hist, heads, goal, device)
+                group_rewards.append(rew)
+                group_data.append((tids_ep, lp_ep, patch_embeds_cpu))
+
+            iter_rewards.extend(group_rewards)
+            gr    = np.array(group_rewards)
+            adv_z = (gr - gr.mean()) / max(gr.std(), 1e-8)
+
+            mini_g = cfg.training.get('mini_g', 0) or cfg.training.g_rollouts
+            n_mb = (cfg.training.g_rollouts + mini_g - 1) // mini_g
+            for mb_start in range(0, cfg.training.g_rollouts, mini_g):
+                mb_end = min(mb_start + mini_g, cfg.training.g_rollouts)
+                for g_idx in range(mb_start, mb_end):
+                    tids_ep, lp_ep, patch_embeds_cpu = group_data[g_idx]
+                    adv_scalar = float(adv_z[g_idx])
+
+                    # 같은 patch_embeds로 n_chunks log-probs 재계산
+                    lp_new_list = recompute_logprobs_grad(
+                        patch_embeds_cpu, tids_ep, vla_raw, p_ids, a_mask, device, dtype
+                    )
+                    lp_old_list = lp_ep
+                    adv_list    = [adv_scalar] * len(lp_new_list)
+
+                    loss = grpo_loss_fn(
+                        lp_new_list, lp_old_list, adv_list,
+                        cfg.training.clip_eps,
+                        cfg.training.kl_coef,
+                    )
+                    (loss / (n_mb * len(z0_batch))).backward()
+                    iter_loss_sum += loss.item()
+                    torch.cuda.empty_cache()
+
+        nn.utils.clip_grad_norm_(trainable, cfg.training.grad_clip)
+        optimizer.step()
+        scheduler.step()
+
+        mean_r = np.mean(iter_rewards) if iter_rewards else 0.0
+        if use_ddp:
+            dist.barrier()
+
+        n_grads = len(z0_batch) * cfg.training.g_rollouts
+        mean_loss = iter_loss_sum / max(n_grads, 1)
+        if is_main() and iteration % cfg.training.log_every == 0:
             log.info(
-                f"[Iter {iteration:04d}]  "
-                f"loss={info['loss/total']:.4f}  "
-                f"reward_mean={info['reward/mean']:.4f}  "
-                f"reward_max={info['reward/max']:.4f}  "
-                f"clip_frac={info['ratio/clip_frac']:.3f}"
+                f"[Iter {iteration:04d}]  reward={mean_r:.4f}  "
+                f"loss={mean_loss:.4f}  "
+                f"lr={scheduler.get_last_lr()[0]:.2e}"
             )
-            if not args.debug:
-                wandb.log({**info, "iteration": iteration})
+            if use_wandb:
+                import wandb
+                wandb.log({'reward': mean_r, 'loss': mean_loss, 'iteration': iteration})
 
-        # ── Checkpoint ───────────────────────────────────────────────────
-        if iteration % cfg.training.save_interval == 0:
-            torch.save({
-                "iteration":   iteration,
-                "policy":      policy.state_dict(),
-                "reward_mean": info["reward/mean"],
-            }, out_dir / f"ckpt_iter{iteration:04d}.pt")
+        if is_main() and iteration % cfg.training.save_every == 0:
+            ckpt = {
+                'iteration': iteration,
+                'vla': vla_raw.state_dict(),
+                'reward_mean': mean_r,
+            }
+            torch.save(ckpt, out_dir / f'ckpt_iter{iteration:04d}.pt')
+            if mean_r > best_reward:
+                best_reward = mean_r
+                torch.save(ckpt, out_dir / 'best.pt')
+                log.info(f"  ★ New best reward={best_reward:.4f}")
 
-        mean_r = info["reward/mean"]
-        if mean_r > best_reward:
-            best_reward = mean_r
-            torch.save({
-                "iteration":   iteration,
-                "policy":      policy.state_dict(),
-                "reward_mean": mean_r,
-            }, out_dir / "best.pt")
-            log.info(f"  ★ New best reward={best_reward:.4f}")
-
-    log.info(f"Stage 3 done.  Best reward={best_reward:.4f}")
+    if is_main():
+        log.info(f"Stage 3 done.  Best reward={best_reward:.4f}")
+    if use_wandb:
+        import wandb; wandb.finish()
+    if use_ddp:
+        cleanup_ddp()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
+    

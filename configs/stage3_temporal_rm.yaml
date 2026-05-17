@@ -1,0 +1,42 @@
+# Stage 3 — Temporal Reward Model + freeze_projector
+experiment:
+  name: swm_stage3_temporal_rm_square
+  seed: 42
+  output_dir: outputs/stage3/temporal_rm/square
+
+task: square
+unnorm_key: square_d0_300_demos
+
+reward_type: reward_model
+reward_model_ckpt: outputs/stage2_5_v3/square/best.pt
+
+reward_model:
+  latent_dim: 2176
+  hidden_dim: 256
+  n_frames: 8
+  n_heads: 4
+  n_layers: 2
+
+vla_path: /NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO/checkpoint_files/SFT_models/square
+swm_ckpt: outputs/stage2/multitask_dinosiglip/best.pt
+stage1_ckpt: outputs/stage1/multitask_dinosiglip/best.pt
+
+data_root: /NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO-JEPA/data
+
+training:
+  iterations: 200
+  max_demos: 300
+  n_states_per_iter: 4
+  g_rollouts: 8
+  mini_g: 2
+  n_rollout_chunks: 20
+  temperature: 1.2
+  full_finetune: false
+  freeze_projector: true
+  gradient_checkpointing: false
+  lr: 5.0e-6
+  clip_eps: 0.2
+  kl_coef: 0.05
+  grad_clip: 1.0
+  log_every: 1
+  save_every: 20

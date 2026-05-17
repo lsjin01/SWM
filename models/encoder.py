@@ -1,16 +1,19 @@
 # models/encoder.py
 """
-SWM Encoder — V-JEPA-2 ViT-Giant
-----------------------------------
-정확한 아키텍처 (checkpoint에서 측정):
-  embed_dim  : 1408
-  num_layers : 40
-  num_heads  : 22  (head_dim=64)
-  ffn_dim    : 6144
-  patch_embed: 3D Conv (1408, 3, 2, 16, 16)
+SWM Encoder — DINOv2 + SigLIP (OpenVLA compatible)
+----------------------------------------------------
+OpenVLA vision backbone에서 DINOv2 + SigLIP을 그대로 사용.
 
-단일 이미지 처리:
-  image (B,3,H,W) → unsqueeze(T=2) → 3D patch embed → ViT → mean pool → z_t (B,1408)
+구조:
+  image → DINOv2 (frozen) → (256, 1024)
+  image → SigLIP (frozen) → (256, 1152)
+  concat → (256, 2176) → mean pool → z_t (2176)
+
+장점:
+  - OpenVLA projector와 완벽 호환 (2176 → projector input)
+  - 언어 정렬된 feature space (SigLIP)
+  - 강한 visual representation (DINOv2)
+  - Stage 3에서 z_t → projector → LLM 바로 연결 가능
 """
 
 from __future__ import annotations
@@ -21,197 +24,147 @@ import torch
 import torch.nn as nn
 
 
-def _strip_module(sd: dict) -> OrderedDict:
-    """'module.xxx' → 'xxx'"""
-    return OrderedDict(
-        (k[len("module."):] if k.startswith("module.") else k, v)
-        for k, v in sd.items()
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# V-JEPA-2 정확한 아키텍처
-# ─────────────────────────────────────────────────────────────────────────────
-
-class Attention(nn.Module):
-    """Multi-head self-attention (V-JEPA-2 스타일: qkv fused)."""
-    def __init__(self, dim, num_heads):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim  = dim // num_heads
-        self.scale     = self.head_dim ** -0.5
-        self.qkv  = nn.Linear(dim, dim * 3, bias=True)
-        self.proj = nn.Linear(dim, dim, bias=True)
-
-    def forward(self, x):
-        B, L, D = x.shape
-        qkv = self.qkv(x).reshape(B, L, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)
-
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        x = (attn @ v).transpose(1, 2).reshape(B, L, D)
-        return self.proj(x)
-
-
-class MLP(nn.Module):
-    def __init__(self, dim, ffn_dim):
-        super().__init__()
-        self.fc1 = nn.Linear(dim, ffn_dim)
-        self.fc2 = nn.Linear(ffn_dim, dim)
-        self.act = nn.GELU()
-
-    def forward(self, x):
-        return self.fc2(self.act(self.fc1(x)))
-
-
-class Block(nn.Module):
-    """Pre-norm Transformer block."""
-    def __init__(self, dim, num_heads, ffn_dim):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn  = Attention(dim, num_heads)
-        self.norm2 = nn.LayerNorm(dim)
-        self.mlp   = MLP(dim, ffn_dim)
-
-    def forward(self, x):
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
-        return x
-
-
-class PatchEmbed3D(nn.Module):
-    """3D Conv patch embedding for video input."""
-    def __init__(self, embed_dim=1408, in_chans=3,
-                 t_patch=2, h_patch=16, w_patch=16):
-        super().__init__()
-        self.proj = nn.Conv3d(
-            in_chans, embed_dim,
-            kernel_size=(t_patch, h_patch, w_patch),
-            stride=(t_patch, h_patch, w_patch),
-        )
-
-    def forward(self, x):
-        # x: (B, C, T, H, W)
-        x = self.proj(x)   # (B, D, t', h', w')
-        B, D, t, h, w = x.shape
-        return x.flatten(2).transpose(1, 2)   # (B, t*h*w, D)
-
-
-class VJepa2Encoder(nn.Module):
+class DINOSigLIPEncoder(nn.Module):
     """
-    V-JEPA-2 ViT-Giant encoder.
-    image (B,3,H,W) → z_t (B, 1408)
+    OpenVLA의 vision backbone (DINOv2 + SigLIP)을 그대로 사용.
+    두 encoder를 frozen으로 유지하고 feature를 concat.
+
+    image (B, 3, H, W) → z_t (B, 2176)
     """
 
-    EMBED_DIM  = 1408
-    NUM_LAYERS = 40
-    NUM_HEADS  = 22
-    FFN_DIM    = 6144
+    DINO_DIM   = 1024
+    SIGLIP_DIM = 1152
+    EMBED_DIM  = 2176   # concat dim = projector input dim
 
     def __init__(
         self,
-        ckpt_path: Optional[str] = None,
-        img_size: int = 224,
-        t_patch: int = 2,
-        h_patch: int = 16,
-        w_patch: int = 16,
-        freeze: bool = False,
+        vla_path: str,
+        freeze: bool = True,
     ):
         super().__init__()
-        D = self.EMBED_DIM
-        self.t_patch = t_patch
-        self.embed_dim = D
+        self._load_from_vla(vla_path, freeze)
+        self.embed_dim = self.EMBED_DIM
 
-        # Patch embed (3D)
-        self.patch_embed = PatchEmbed3D(D, 3, t_patch, h_patch, w_patch)
+    def _load_from_vla(self, vla_path: str, freeze: bool):
+        """OpenVLA에서 vision backbone만 추출."""
+        import sys
+        sys.path.insert(0, '/NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO-JEPA/dependencies/openvla-oft')
+        from transformers import AutoModelForVision2Seq
 
-        # Positional embedding
-        num_h = img_size // h_patch   # 14
-        num_w = img_size // w_patch   # 14
-        num_t = 1                      # T=2 → t'=1
-        self.pos_embed = nn.Parameter(
-            torch.zeros(1, num_t * num_h * num_w, D)
+        print(f"[DINOSigLIPEncoder] Loading vision backbone from {vla_path} ...")
+        vla = AutoModelForVision2Seq.from_pretrained(
+            vla_path,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
         )
 
-        # Transformer blocks
-        self.blocks = nn.ModuleList([
-            Block(D, self.NUM_HEADS, self.FFN_DIM)
-            for _ in range(self.NUM_LAYERS)
-        ])
-        self.norm = nn.LayerNorm(D)
+        # DINOv2 + SigLIP 추출
+        self.dino   = vla.vision_backbone.featurizer       # DINOv2
+        self.siglip = vla.vision_backbone.fused_featurizer # SigLIP
 
-        if ckpt_path is not None:
-            self._load(ckpt_path)
-        else:
-            print("[VJepa2Encoder] No ckpt — random init")
+        # 메모리 해제 (VLA 나머지 부분)
+        del vla
+        torch.cuda.empty_cache()
 
         if freeze:
-            for p in self.parameters():
+            for p in self.dino.parameters():
+                p.requires_grad = False
+            for p in self.siglip.parameters():
                 p.requires_grad = False
 
-    def _load(self, ckpt_path: str):
-        raw = torch.load(ckpt_path, map_location="cpu")
-        sd  = _strip_module(raw.get("encoder", raw))
+        print(f"[DINOSigLIPEncoder] Loaded  "
+              f"DINOv2({self.DINO_DIM}) + SigLIP({self.SIGLIP_DIM}) "
+              f"= {self.EMBED_DIM}  freeze={freeze}")
 
-        # 키 매핑: checkpoint → 현재 모델
-        # checkpoint keys: patch_embed.proj.*, blocks.N.norm1/norm2/attn.qkv/attn.proj/mlp.fc1/mlp.fc2, norm.*
-        # model keys:      patch_embed.proj.*, blocks.N.norm1/norm2/attn.qkv/attn.proj/mlp.fc1/mlp.fc2, norm.*
-        # → 키 구조가 동일하므로 그대로 로드 가능 (pos_embed 제외)
-        filtered = OrderedDict()
-        for k, v in sd.items():
-            if "pos_embed" in k or "cls_token" in k:
-                # shape 불일치 가능 → skip
-                continue
-            filtered[k] = v
+    # per-backbone normalization constants
+    _DINO_MEAN   = [0.485, 0.456, 0.406]
+    _DINO_STD    = [0.229, 0.224, 0.225]
+    _SIGLIP_MEAN = [0.5,   0.5,   0.5  ]
+    _SIGLIP_STD  = [0.5,   0.5,   0.5  ]
 
-        missing, unexpected = self.load_state_dict(filtered, strict=False)
-        print(f"[VJepa2Encoder] Loaded from {ckpt_path}")
-        print(f"  missing={len(missing)}  unexpected={len(unexpected)}")
-        if missing:
-            print(f"  missing sample: {missing[:3]}")
+    def _split_normalize(self, image_01: torch.Tensor, dtype):
+        """
+        image_01: (B, 3, H, W) in [0, 1] range
+        → dino_img:   ImageNet normalized
+        → siglip_img: SigLIP normalized
+        """
+        def _norm(img, mean, std):
+            m = torch.tensor(mean, device=img.device, dtype=dtype).view(1, 3, 1, 1)
+            s = torch.tensor(std,  device=img.device, dtype=dtype).view(1, 3, 1, 1)
+            return (img - m) / s
+
+        return _norm(image_01, self._DINO_MEAN, self._DINO_STD), \
+               _norm(image_01, self._SIGLIP_MEAN, self._SIGLIP_STD)
+
+    def forward_spatial(self, image: torch.Tensor) -> torch.Tensor:
+        """
+        image: (B, 3, H, W) in [0, 1] range (ToTensor만, Normalize 없음)
+        → spatial patch features: (B, 256, 2176)  [공간 정보 보존]
+        DINOv2 / SigLIP 각자 올바른 normalization 적용.
+        """
+        dtype = next(self.dino.parameters()).dtype
+        image_01 = image.to(dtype).clamp(0, 1)
+
+        dino_img, siglip_img = self._split_normalize(image_01, dtype)
+
+        dino_feat = self.dino.forward_features(dino_img)
+        if dino_feat.ndim == 3:
+            dino_feat = dino_feat[:, -256:]        # (B, 256, 1024)
+
+        siglip_feat = self.siglip.forward_features(siglip_img)
+        if siglip_feat.ndim == 3:
+            siglip_feat = siglip_feat[:, -256:]    # (B, 256, 1152)
+
+        return torch.cat([dino_feat, siglip_feat], dim=-1)  # (B, 256, 2176)
 
     def forward(self, image: torch.Tensor) -> torch.Tensor:
-        """image (B,3,H,W) → z_t (B, 1408)"""
-        B = image.shape[0]
-        # T=2로 복제 (video encoder 입력)
-        x = image.unsqueeze(2).expand(-1, -1, self.t_patch, -1, -1)  # (B,3,2,H,W)
-        x = self.patch_embed(x)   # (B, L, 1408)
+        """
+        image: (B, 3, H, W) in [0, 1] range
+        → global z_t: (B, 2176)  [transition / reward 전용]
+        """
+        return self.forward_spatial(image).mean(dim=1)
 
-        if self.pos_embed.shape[1] == x.shape[1]:
-            x = x + self.pos_embed
-
-        for blk in self.blocks:
-            x = blk(x)
-        x = self.norm(x)
-        return x.mean(dim=1)   # (B, 1408)  mean pool
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SWM Encoder
-# ─────────────────────────────────────────────────────────────────────────────
 
 class SWMEncoder(nn.Module):
+    """
+    Stage 1 Encoder:
+      DINOSigLIPEncoder(image) → z_t (B, 2176)
+
+    latent_dim=2176로 고정 (projector 호환)
+    """
+
     def __init__(
         self,
-        vjepa2_ckpt: Optional[str] = None,
-        freeze_backbone: bool = False,
-        latent_dim: int = 1408,
-        img_size: int = 224,
+        vla_path: str,
+        freeze_backbone: bool = True,
+        latent_dim: int = 2176,
     ):
         super().__init__()
-        self.backbone = VJepa2Encoder(
-            ckpt_path=vjepa2_ckpt,
-            img_size=img_size,
+        self.backbone = DINOSigLIPEncoder(
+            vla_path=vla_path,
             freeze=freeze_backbone,
         )
-        # latent_dim == embed_dim이면 proj 불필요하지만 유연성을 위해 유지
-        self.proj = nn.Sequential(
-            nn.Linear(self.backbone.embed_dim, latent_dim),
-            nn.LayerNorm(latent_dim),
-        )
+        # latent_dim == embed_dim이면 proj 생략 가능하지만 유연성을 위해 유지
+        if latent_dim == self.backbone.embed_dim:
+            self.proj = nn.Identity()
+        else:
+            self.proj = nn.Sequential(
+                nn.Linear(self.backbone.embed_dim, latent_dim),
+                nn.LayerNorm(latent_dim),
+            )
         self.latent_dim = latent_dim
 
+    def encode_spatial(self, image: torch.Tensor) -> torch.Tensor:
+        """image (B,3,H,W) → spatial patch features (B, 256, latent_dim) [VLA projector용]"""
+        spatial = self.backbone.forward_spatial(image)  # (B, 256, 2176)
+        # Identity proj인 경우 그대로 반환, 아니면 per-token projection 필요
+        if isinstance(self.proj, nn.Identity):
+            return spatial.float()
+        # Linear projection: (B, 256, 2176) → (B, 256, latent_dim)
+        return self.proj[0](spatial.float())  # Linear만 적용 (LayerNorm 생략)
+
     def forward(self, image: torch.Tensor) -> torch.Tensor:
-        return self.proj(self.backbone(image))
+        """image (B,3,H,W) → global z_t (B, latent_dim) [transition / reward 전용]"""
+        z = self.proj(self.backbone(image))
+        return z.float()
