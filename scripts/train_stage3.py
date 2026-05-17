@@ -279,31 +279,32 @@ def transition_l2_reward(z_history, z_goal_transition, device):
 @torch.no_grad()
 def latent_reward(z_history, z_goal, device, metric='cosine', z_init=None):
     """
-    Reward = mean over trajectory of normalized cosine progress toward goal.
+    Reward = normalized cosine progress at ENDPOINT (z_T only) toward goal(s).
 
-    For each z_t in z_history:
-      progress_t = (cos(z_t, z_goal) - cos(z_init, z_goal)) / (1 - cos(z_init, z_goal))
-    reward = mean(progress_t)
+    z_goal: Tensor(1, D)         → single goal  (n_goals=1)
+            list[Tensor(1, D)]   → multi-goal   (n_goals=K)
+              average reward across K goals (endpoint only)
 
-    This rewards consistent progress throughout the trajectory,
-    not just the final state.
+    reward = (cos(z_T, goal_k) - cos(z_init, goal_k)) / (1 - cos(z_init, goal_k))
     """
     if len(z_history) == 0:
         return 0.0
+
+    # Multi-goal: recurse per goal and average
+    if isinstance(z_goal, (list, tuple)):
+        rewards = [latent_reward(z_history, g, device, metric, z_init) for g in z_goal]
+        return float(sum(rewards) / len(rewards))
+
     z_g = z_goal.float().to(device)
+    z_final = z_history[-1].float().to(device)
     if metric == 'cosine':
         if z_init is not None:
             cos_0 = F.cosine_similarity(z_init.float().to(device), z_g).mean().item()
             denom = max(1.0 - cos_0, 1e-4)
-            progresses = []
-            for z_t in z_history:
-                cos_t = F.cosine_similarity(z_t.float().to(device), z_g).mean().item()
-                progresses.append((cos_t - cos_0) / denom)
-            return float(sum(progresses) / len(progresses))
-        z_final = z_history[-1].float().to(device)
+            cos_T = F.cosine_similarity(z_final, z_g).mean().item()
+            return (cos_T - cos_0) / denom
         return F.cosine_similarity(z_final, z_g).mean().item()
     else:
-        z_final = z_history[-1].float().to(device)
         return -(z_final - z_g).norm(dim=-1).mean().item()
 
 
@@ -324,7 +325,8 @@ def reward_model_reward(z_history, z_goal, reward_model, device):
 
 @torch.no_grad()
 def load_initial_states(demo_dir, task, encoder, max_demos, device, dtype,
-                        reward_type='graph', transition=None, rollout_steps=64):
+                        reward_type='graph', transition=None, rollout_steps=64,
+                        n_goals=1):
     """
     데모 첫 프레임을 인코딩.
 
@@ -377,10 +379,21 @@ def load_initial_states(demo_dir, task, encoder, max_demos, device, dtype,
                 init_goals.append(z_t.cpu())
 
             elif reward_type in ('latent', 'reward_model'):
-                goal_np = f[f'data/{dn}/obs/agentview_image'][-1]
-                goal_t  = transform(goal_np).unsqueeze(0).to(device)
-                z_goal  = encoder(goal_t).to(dtype)
-                init_goals.append(z_goal.cpu())
+                imgs = f[f'data/{dn}/obs/agentview_image']
+                T_demo = len(imgs)
+                if n_goals == 1:
+                    # single goal: last frame only (backward compatible)
+                    indices = [T_demo - 1]
+                else:
+                    # K goals uniformly sampled: 1/K, 2/K, ..., K/K of demo
+                    indices = [max(0, int(round((k + 1) * (T_demo - 1) / n_goals)))
+                               for k in range(n_goals)]
+                goal_latents = []
+                for idx in indices:
+                    goal_t = transform(imgs[idx]).unsqueeze(0).to(device)
+                    goal_latents.append(encoder(goal_t).to(dtype).cpu())
+                # single goal → Tensor, multi-goal → list[Tensor]
+                init_goals.append(goal_latents[0] if n_goals == 1 else goal_latents)
 
             else:  # 'graph'
                 obj = f[f'data/{dn}/obs/object'][-1]
@@ -576,11 +589,13 @@ def main():
         log.info(f"Pre-encoding initial states ...  reward_type={reward_type}")
     # transition_l2: rollout_steps = n_rollout_chunks × NUM_ACTIONS_CHUNK
     rollout_steps = cfg.training.n_rollout_chunks * NUM_ACTIONS_CHUNK
+    n_goals = cfg.get('n_goals', 1)
     init_images, init_latents, init_goals = load_initial_states(
         cfg.data_root, task, encoder, cfg.training.max_demos, device, dtype,
         reward_type=reward_type,
         transition=transition,
         rollout_steps=rollout_steps,
+        n_goals=n_goals,
     )
 
     # ── Reward model 로딩 (reward_type='reward_model'일 때만) ─────────────────

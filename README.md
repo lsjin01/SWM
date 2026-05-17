@@ -61,15 +61,15 @@ python scripts/train_stage1.py --config configs/stage1_multitask_dinosiglip.yaml
 # Stage 2: Transition
 python scripts/train_stage2.py --config configs/stage2_multitask_dinosiglip.yaml
 
-# Stage 3: GRPO (temporal progress reward)
+# Stage 3: GRPO (multi-goal endpoint reward, n_goals=4)
 export CUDA_VISIBLE_DEVICES=2,3,7
 torchrun --nproc_per_node=3 --master_port=29507 \
     scripts/train_stage3.py \
-    --config configs/stage3_latent_cos_temporal_v2.yaml
+    --config configs/stage3_multi_goal.yaml
 
-# Eval
-USE_Z_BYPASS=0 CUDA_VISIBLE_DEVICES=0 \
-TASK=square CKPT_PATH=outputs/stage3/latent_cos_temporal_v2/square/best.pt \
+# Eval (USE_Z_BYPASS=0 필수 — 학습 전용 최적화)
+USE_Z_BYPASS=0 CUDA_VISIBLE_DEVICES=2 \
+TASK=square CKPT_PATH=outputs/stage3/multi_goal/square/best.pt \
 bash eval/run_eval.sh
 ```
 
@@ -94,8 +94,8 @@ bash eval/run_eval.sh
 | 3 | Stage 3 temporal_rm | temporal RM | —  | reward=0.0003 고정, GRPO 동작 안 함 |
 | 4 | Stage 3 latent_cos (절대값) | cos(z_T, z_goal) | — | reward=0.97 고정, variance 없음 |
 | 5 | **Stage 3 latent_cos (정규화)** | (cos_T − cos_0)/(1−cos_0) | **24%** | SFT 대비 +8%p, WMPO P128 동등 |
-| 6 | Stage 3 latent_cos_temporal | trajectory 전체 평균 progress | TBD | 학습 완료 후 eval 예정 |
-| 7 | Stage 3 latent_cos_temporal_v2 | 위와 동일 + n_states×4 | TBD | 다음 실험 예정 |
+| 6 | Stage 3 latent_cos_temporal | trajectory 전체 평균 progress | **10%** | 정규화 endpoint(24%)보다 열등 — variance 희석 |
+| 7 | Stage 3 multi_goal (n_goals=4) | endpoint, K=4 중간 목표 평균 | TBD | 현재 학습 중 |
 
 ---
 
@@ -111,19 +111,28 @@ bash eval/run_eval.sh
 - `reward = cos_sim(z_T, z_goal)`
 - 문제: z_init과 z_goal이 이미 cosine sim≈0.97 → 모든 rollout reward 동일
 
-### 현재 방식 (정규화된 temporal progress)
+### 현재 방식 (Multi-goal Endpoint Progress)
 
 ```python
-# 각 timestep t에서 goal을 향한 progress 측정
-progress_t = (cos(z_t, z_goal) - cos(z_init, z_goal)) / (1 - cos(z_init, z_goal))
+# demo 궤적에서 K개 중간 목표 균등 샘플링 (25%, 50%, 75%, 100%)
+# 각 목표에 대해 endpoint z_T의 progress 측정
+for goal_k in [z_25, z_50, z_75, z_100]:
+    progress_k = (cos(z_T, goal_k) - cos(z_init, goal_k)) / (1 - cos(z_init, goal_k))
 
-# 궤적 전체 평균 (최종 state만 보지 않음)
-reward = mean_t(progress_t)
+reward = mean_k(progress_k)
 ```
 
 - `reward=0`: 제자리 (아무 progress 없음)
-- `reward=1`: goal에 완전 도달
-- 실제 범위: −0.05 ~ 0.24 (GRPO에 충분한 variance)
+- `reward=1`: 모든 중간 목표에 완전 도달
+- 실제 범위: −0.05 ~ 0.5 (다양한 목표로 인해 variance 증가 기대)
+
+### 이전 방식 비교
+
+| 방식 | reward 계산 | SR |
+|------|------------|-----|
+| endpoint (n_goals=1) | `(cos_T − cos_0)/(1−cos_0)` | 24% |
+| temporal average | `mean_t[(cos_t − cos_0)/(1−cos_0)]` | 10% ↓ |
+| **multi-goal endpoint (n_goals=4)** | `mean_k endpoint progress` | TBD |
 
 ---
 
@@ -137,7 +146,9 @@ reward = mean_t(progress_t)
 
 4. **z_init 정규화** — cosine similarity의 절대값이 아닌 초기 상태 대비 상대적 progress를 측정해야 의미있는 학습 signal 생성.
 
-5. **Temporal reward** — 최종 state만 보는 것보다 궤적 전체 평균이 일관적인 학습 signal 제공.
+5. **Temporal averaging HURTS** — 궤적 160 step 전체 평균은 per-rollout variance를 희석 → GRPO signal 약화(10%). endpoint(z_T only)가 더 좋음(24%).
+
+6. **Multi-goal endpoint** — K개 중간 목표에 대해 각각 endpoint progress를 계산 후 평균. variance 유지 + curriculum signal 추가.
 
 ---
 
