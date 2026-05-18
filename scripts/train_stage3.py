@@ -137,6 +137,7 @@ def swm_rollout(
     temperature: float,
     device: torch.device,
     dtype: torch.dtype,
+    patch_weights: torch.Tensor = None,  # (256,) CPU — spatial weighted mean pool
 ):
     """
     수정된 SWM rollout:
@@ -180,7 +181,12 @@ def swm_rollout(
                 a = actions[0, sub].to(device, dtype)
                 z = transition(z.to(dtype), a.unsqueeze(0))
                 if is_spatial:
-                    z_history.append(z.mean(dim=1).clone())  # (B, d_s) for reward
+                    if patch_weights is not None:
+                        w = patch_weights.to(z.device, z.dtype)   # (256,)
+                        z_r = (z * w.unsqueeze(0).unsqueeze(-1)).sum(dim=1)
+                    else:
+                        z_r = z.mean(dim=1)
+                    z_history.append(z_r.clone())              # (B, d_s)
                 else:
                     z_history.append(z.clone())
 
@@ -336,6 +342,57 @@ def latent_reward(z_history, z_goal, device, metric='cosine', z_init=None, pca=N
         return F.cosine_similarity(dz_T, dz_goal).mean().item()
     else:
         return -(z_final - z_g).norm(dim=-1).mean().item()
+
+
+@torch.no_grad()
+def compute_spatial_patch_weights(
+    demo_dir, task, encoder, transition, max_demos, device, dtype,
+    method='attn', top_k=64, stride=4,
+):
+    """
+    Demo transitions에서 spatial patch weights 계산.
+    method='attn'  : SpatialSWMTransition 마지막 layer action→patch attention
+    method='delta' : Δs = ||s_{t+1} - s_t||₂ per patch
+    Returns: (256,) normalized weight tensor (CPU)
+    """
+    import h5py
+    from torchvision import transforms
+
+    hdf5 = os.path.join(
+        demo_dir, 'demos', 'core_datasets', task,
+        f'demo_src_{task}_task_D0', 'demo.hdf5'
+    )
+    transform = transforms.Compose([
+        transforms.ToPILImage(), transforms.Resize((224, 224)), transforms.ToTensor(),
+    ])
+
+    weights_acc = torch.zeros(256)
+    count = 0
+
+    with h5py.File(hdf5, 'r') as f:
+        demos = sorted(f['data'].keys())[:max_demos]
+        for dn in demos:
+            imgs    = f[f'data/{dn}/obs/agentview_image']
+            actions = np.array(f[f'data/{dn}/actions'])
+            T = len(imgs)
+            for t in range(0, T - 1, stride):
+                img_t = transform(np.array(imgs[t])).unsqueeze(0).to(device)
+                s_t   = encoder.encode_spatial_projected(img_t).to(dtype)   # (1, 256, d_s)
+                a_t   = torch.from_numpy(actions[t]).to(device, dtype).unsqueeze(0)  # (1, 7)
+                if method == 'attn':
+                    w = transition.get_patch_weights(s_t, a_t, top_k=top_k)
+                else:
+                    w = transition.get_delta_weights(s_t, a_t, top_k=top_k)
+                weights_acc += w.float()
+                count += 1
+
+    weights = weights_acc / max(count, 1)
+    weights = weights / weights.sum().clamp(min=1e-8)
+    if is_main():
+        nonzero = int((weights > 0).sum())
+        log.info(f"[patch_weights/{method}] demos={len(demos)}  steps={count}  "
+                 f"nonzero={nonzero}/256  top_k={top_k}")
+    return weights   # (256,) CPU
 
 
 def fit_demo_pca(demo_dir, task, encoder, max_demos, device, dtype, n_components=16, stride=2, token_weights=None):
@@ -521,7 +578,7 @@ def reward_model_reward(z_history, z_goal, reward_model, device):
 def load_initial_states(demo_dir, task, encoder, max_demos, device, dtype,
                         reward_type='graph', transition=None, rollout_steps=64,
                         n_goals=1, token_weights=None, pca=None,
-                        pca_goal_threshold=0.2):
+                        pca_goal_threshold=0.2, patch_weights=None):
     """
     데모 첫 프레임을 인코딩.
 
@@ -651,7 +708,12 @@ def load_initial_states(demo_dir, task, encoder, max_demos, device, dtype,
                 for idx in indices:
                     goal_t = transform(imgs[idx]).unsqueeze(0).to(device)
                     if hasattr(encoder, 'spatial_proj') and getattr(encoder, 'spatial_dim', None) is not None and token_weights is None:
-                        goal_latents.append(encoder.encode_spatial_projected(goal_t).to(dtype).mean(dim=1).cpu())
+                        sp = encoder.encode_spatial_projected(goal_t).to(dtype)  # (1, 256, d_s)
+                        if patch_weights is not None:
+                            w = patch_weights.to(sp.device, sp.dtype)
+                            goal_latents.append((sp * w.unsqueeze(0).unsqueeze(-1)).sum(dim=1).cpu())
+                        else:
+                            goal_latents.append(sp.mean(dim=1).cpu())
                     elif token_weights is not None:
                         goal_latents.append(encoder.encode_weighted(goal_t, token_weights).to(dtype).cpu())
                     else:
@@ -894,6 +956,19 @@ def main():
             device, dtype, method=spatial_pooling, top_k=spatial_top_k,
         )
 
+    # ── Spatial patch weights (attn / delta) — Phase 2 전용 ──────────────────
+    patch_weights = None
+    patch_weight_method = cfg.get('patch_weight_method', None)
+    if patch_weight_method in ('attn', 'delta') and use_spatial_swm:
+        spatial_top_k_pw = cfg.get('patch_weight_top_k', 64)
+        if is_main():
+            log.info(f"Computing spatial patch weights (method={patch_weight_method}, "
+                     f"top_k={spatial_top_k_pw}) ...")
+        patch_weights = compute_spatial_patch_weights(
+            cfg.data_root, task, encoder, transition, cfg.training.max_demos,
+            device, dtype, method=patch_weight_method, top_k=spatial_top_k_pw,
+        )
+
     # ── PCA fit (pca_cosine / pca_delta_cosine) ──────────────────────────────
     # token_weights 전달 → spatial pooling 시 encode_weighted로 PCA 학습 (분포 일치)
     demo_pca = None
@@ -920,6 +995,7 @@ def main():
         token_weights=token_weights,
         pca=demo_pca,
         pca_goal_threshold=cfg.get('pca_goal_threshold', 0.2),
+        patch_weights=patch_weights,
     )
 
     # ── Reward model 로딩 (reward_type='reward_model'일 때만) ─────────────────
@@ -1002,6 +1078,7 @@ def main():
                     cfg.training.n_rollout_chunks,
                     cfg.training.temperature,
                     device, dtype,
+                    patch_weights=patch_weights,
                 )
                 if reward_type == 'transition_l2':
                     rew = transition_l2_reward(z_hist, goal, device)

@@ -178,6 +178,63 @@ class SpatialSWMTransition(nn.Module):
         x = self.norm(x[:, 1:, :])                   # (B, N, hidden)
         return self.out(x)                           # (B, N, spatial_dim)
 
+    @torch.no_grad()
+    def get_patch_weights(
+        self,
+        s_t:    torch.Tensor,   # (B, N, spatial_dim)
+        action: torch.Tensor,   # (B, 7)
+        top_k:  int = 64,
+    ) -> torch.Tensor:
+        """
+        마지막 Transformer layer의 action token → patch token attention 추출.
+        Returns: (N,) normalized weight tensor (CPU)
+        """
+        x = self.token_embed(s_t)
+        a = self.action_embed(action).unsqueeze(1)
+        x = torch.cat([a, x], dim=1)              # (B, N+1, hidden)
+
+        for layer in self.blocks.layers[:-1]:
+            x = layer(x)
+
+        # 마지막 layer: attention 직접 추출 (norm_first=True)
+        last = self.blocks.layers[-1]
+        x_norm = last.norm1(x)
+        _, attn = last.self_attn(
+            x_norm, x_norm, x_norm,
+            need_weights=True, average_attn_weights=True,
+        )                                          # (B, N+1, N+1)
+
+        # action token(0) → patch tokens(1:)
+        patch_w = attn[:, 0, 1:].mean(0).float().cpu()  # (N,)
+
+        if top_k < patch_w.shape[0]:
+            mask = torch.zeros_like(patch_w)
+            mask[patch_w.topk(top_k).indices] = 1.0
+            patch_w = patch_w * mask
+
+        return patch_w / patch_w.sum().clamp(min=1e-8)
+
+    @torch.no_grad()
+    def get_delta_weights(
+        self,
+        s_t:    torch.Tensor,   # (B, N, spatial_dim)
+        action: torch.Tensor,   # (B, 7)
+        top_k:  int = 64,
+    ) -> torch.Tensor:
+        """
+        Δs = ||s_{t+1} - s_t||₂ per patch → task-relevant 패치 식별.
+        Returns: (N,) normalized weight tensor (CPU)
+        """
+        s_next = self.forward(s_t, action)                    # (B, N, spatial_dim)
+        delta  = (s_next - s_t).norm(dim=-1).mean(0).float().cpu()  # (N,)
+
+        if top_k < delta.shape[0]:
+            mask = torch.zeros_like(delta)
+            mask[delta.topk(top_k).indices] = 1.0
+            delta = delta * mask
+
+        return delta / delta.sum().clamp(min=1e-8)
+
     def rollout(
         self,
         s0:      torch.Tensor,   # (B, N, spatial_dim)
