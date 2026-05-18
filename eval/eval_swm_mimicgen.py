@@ -214,8 +214,20 @@ def load_swm_model(
 
     # ── Stage 2: Transition ───────────────────────────────────────────────
     sd2 = torch.load(stage2_ckpt, map_location=device, weights_only=False)
-    transition = SWMTransition(latent_dim=latent_dim).to(device)
-    transition.load_state_dict(sd2["transition"])
+    if "spatial_proj" in sd2:
+        from models.transition import SpatialSWMTransition
+        spatial_dim = sd2.get("spatial_dim", 256)
+        encoder.spatial_proj = torch.nn.Sequential(
+            torch.nn.Linear(latent_dim, spatial_dim),
+            torch.nn.LayerNorm(spatial_dim),
+        ).to(device)
+        encoder.spatial_proj.load_state_dict(sd2["spatial_proj"])
+        encoder.spatial_proj.eval()
+        transition = SpatialSWMTransition(spatial_dim=spatial_dim).to(device)
+        transition.load_state_dict(sd2["transition"])
+    else:
+        transition = SWMTransition(latent_dim=latent_dim).to(device)
+        transition.load_state_dict(sd2["transition"])
     transition.eval()
     print(f"[SWM] Transition loaded from {stage2_ckpt}")
 
