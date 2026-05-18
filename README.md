@@ -38,12 +38,16 @@ swm/
 │   ├── stage3_multi_goal.yaml              # Uniform 4-goal endpoint (20%)
 │   ├── stage3_pca_goal.yaml                # PCA cosine, n_goals=4 (20%)
 │   ├── stage3_pca_goal_single.yaml         # PCA cosine, n_goals=1 (16%)
-│   ├── stage3_pca_delta.yaml               # PCA delta cosine, n_goals=1
-│   ├── stage3_action_goal.yaml             # Action-velocity based phase detection
-│   ├── stage3_pca_binary.yaml              # PCA binary phase reward (dir.1)
-│   ├── stage3_diversity.yaml               # High-temperature rollout diversity (dir.4)
-│   ├── stage3_pca_max.yaml                 # PCA max-progress aggregation (dir.2)
-│   └── stage3_action_pca_delta.yaml        # Action goal + PCA delta (dir.3)
+│   ├── stage3_pca_delta.yaml               # PCA delta cosine, n_goals=1 (12%)
+│   ├── stage3_action_goal.yaml             # Action-velocity based phase detection (16%)
+│   ├── stage3_pca_binary.yaml              # PCA binary phase reward (dir.1) → 26% last
+│   ├── stage3_diversity.yaml               # High-temperature rollout diversity (dir.4, 24%)
+│   ├── stage3_pca_max.yaml                 # PCA max-progress aggregation (dir.2, 8%)
+│   ├── stage3_action_pca_delta.yaml        # Action goal + PCA delta (dir.3, TBD)
+│   ├── stage3_var_pool.yaml                # Variance-weighted spatial pooling
+│   ├── stage3_corr_pool.yaml               # Correlation-weighted spatial pooling
+│   ├── stage3_act_pool.yaml                # Activation-weighted spatial pooling
+│   └── stage3_slot_attn.yaml               # Slot attention spatial pooling
 ├── models/
 │   ├── encoder.py       # SWMEncoder (DINOv2 + SigLIP, freeze_backbone=True)
 │   ├── transition.py    # SWMTransition (latent=2176, hidden=512, layers=6)
@@ -112,12 +116,16 @@ CUDA_VISIBLE_DEVICES=2 TASK=square \
 | 7 | multi_goal (uniform) | endpoint, K=4 균등 goal 평균 | 20% | 18% | n_goals=4 (25/50/75/100%) |
 | 8 | pca_goal (n_goals=4) | PCA-16 투영 후 cosine progress, K=4 | 20% | 12% | goal 분리도 0.97→0.05 |
 | 9 | pca_goal_single (n_goals=1) | PCA-16 투영 후 cosine progress, K=1 | 16% | 16% | PCA 단일 goal = SFT 동등 |
-| 10 | action_goal | action velocity 기반 phase 탐지, K=4 | TBD | TBD | 실험 진행 중 |
-| 11 | pca_delta | PCA 공간 delta 방향 비교 | TBD | TBD | 실험 진행 중 |
-| 12 | pca_binary (dir.1) | PCA phase binary threshold=0.3 | TBD | TBD | 예정 |
-| 13 | diversity (dir.4) | temperature=2.0, endpoint | TBD | TBD | 예정 |
-| 14 | pca_max (dir.2) | PCA max-progress aggregation | TBD | TBD | 예정 |
-| 15 | action_pca_delta (dir.3) | action goal + PCA delta | TBD | TBD | 예정 |
+| 10 | action_goal | action velocity 기반 phase 탐지, K=4 | 16% | 16% | |
+| 11 | pca_delta | PCA 공간 delta 방향 비교 | 12% | 16% | |
+| 12 | **pca_binary (dir.1)** | PCA phase binary threshold=0.3, K=4 | 20% | **26%** | 현재 최고 (last) |
+| 13 | diversity (dir.4) | temperature=2.0, endpoint cosine | 24% | 18% | baseline 동급 |
+| 14 | pca_max (dir.2) | PCA max-progress aggregation, K=4 | 8% | 12% | max 집계 역효과 |
+| 15 | action_pca_delta (dir.3) | action goal + PCA delta cosine | TBD | TBD | 실험 진행 중 |
+| 16 | var_pool | variance-weighted spatial pooling | TBD | TBD | 실험 예정 |
+| 17 | corr_pool | correlation-weighted spatial pooling | TBD | TBD | 실험 예정 |
+| 18 | act_pool | activation-weighted spatial pooling | TBD | TBD | 실험 예정 |
+| 19 | slot_attn | slot attention spatial pooling (PCA init) | TBD | TBD | 실험 예정 |
 
 ---
 
@@ -181,16 +189,31 @@ reward   = mean_k(binary_k)        # → {0, 0.25, 0.5, 0.75, 1.0}
 | pca_goal (n_goals=4) | `mean_k[progress_k]`, PCA-16 | 20% |
 | pca_goal_single (n_goals=1) | `progress`, PCA-16 | 16% |
 
-### 개선 방향 (chain7~10, 진행 중)
+### 개선 방향 및 결과 (chain7~14)
 
 GRPO 핵심 문제 = **within-group reward variance 부족** (std≈0.07~0.08, 8 rollout이 거의 동일한 reward 수령)
 
+#### Reward Variance 개선 (chain7~10)
+
+| 방향 | 아이디어 | config | SR (best) | SR (last) |
+|------|---------|--------|-----------|-----------|
+| Dir.1 | Binary phase reward: progress_k > 0.3 → 1.0 | `pca_binary` | 20% | **26%** ← 최고 |
+| Dir.2 | Max-progress: mean → max aggregation | `pca_max` | 8% ↓ | 12% |
+| Dir.3 | Action-goal + PCA delta 조합 | `action_pca_delta` | TBD | TBD |
+| Dir.4 | Temperature 2.0 → rollout 다양성 증가 | `diversity` | 24% | 18% |
+
+**분석:** Binary reward (Dir.1)가 가장 효과적 — 이산적 reward {0, 0.25, 0.5, 0.75, 1.0}로 within-group variance 증가. Max aggregation (Dir.2)은 역효과.
+
+#### Mean Pool 문제 해결 (chain11~14)
+
+**근본 문제:** 256 spatial token mean-pool → 배경 토큰이 지배 → goal latent 간 구분 불가 (sim=0.97+)
+
 | 방향 | 아이디어 | config |
 |------|---------|--------|
-| Dir.1 | Binary phase reward: progress_k > 0.3 → 1.0 | `pca_binary` |
-| Dir.2 | Max-progress: mean → max aggregation | `pca_max` |
-| Dir.3 | Action-goal + PCA delta 조합 | `action_pca_delta` |
-| Dir.4 | Temperature 2.0 → rollout 다양성 증가 | `diversity` |
+| Method 1 | Variance-weighted: 시간적으로 많이 변하는 토큰 | `var_pool` |
+| Method 2 | Correlation-weighted: task progress와 상관 높은 토큰 | `corr_pool` |
+| Method 3 | Activation-weighted: activation norm이 큰 토큰 | `act_pool` |
+| Method 4 | Slot attention: PCA init + iterative competition | `slot_attn` |
 
 ---
 

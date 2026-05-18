@@ -369,6 +369,130 @@ def fit_demo_pca(demo_dir, task, encoder, max_demos, device, dtype, n_components
 
 
 @torch.no_grad()
+def compute_spatial_weights(demo_dir, task, encoder, max_demos, device, dtype,
+                             method='variance', top_k=64, stride=4):
+    """
+    Demo 궤적에서 task-relevant spatial token weight 계산.
+      variance   : temporal variance가 큰 토큰 (가장 많이 변하는 위치)
+      correlation: task progress(t/T)와 norm이 가장 상관된 토큰
+      activation : 평균 activation norm이 가장 큰 토큰
+    Returns: (256,) normalized weight tensor (CPU)
+    """
+    import h5py
+    from torchvision import transforms
+
+    hdf5 = os.path.join(
+        demo_dir, 'demos', 'core_datasets', task,
+        f'demo_src_{task}_task_D0', 'demo.hdf5'
+    )
+    transform = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+    ])
+
+    all_spatial  = []
+    all_progress = []
+
+    with h5py.File(hdf5, 'r') as f:
+        demos = sorted(f['data'].keys())[:max_demos]
+        for dn in demos:
+            imgs = f[f'data/{dn}/obs/agentview_image']
+            T = len(imgs)
+            indices = list(range(0, T, stride))
+            seq = []
+            for idx in indices:
+                img_t = transform(imgs[idx]).unsqueeze(0).to(device, dtype)
+                sp = encoder.backbone.forward_spatial(img_t)   # (1, 256, 2176)
+                seq.append(sp.squeeze(0).float().cpu())
+            all_spatial.append(torch.stack(seq))               # (T_s, 256, 2176)
+            all_progress.append(torch.linspace(0, 1, len(indices)))
+
+    if method == 'variance':
+        parts = []
+        for sp in all_spatial:
+            parts.append(sp.var(dim=0).norm(dim=-1))           # (256,)
+        weights = torch.stack(parts).mean(dim=0)
+
+    elif method == 'correlation':
+        parts = []
+        for sp, prog in zip(all_spatial, all_progress):
+            norms  = sp.norm(dim=-1)                           # (T_s, 256)
+            p      = prog.unsqueeze(-1)                        # (T_s, 1)
+            n_c    = norms - norms.mean(dim=0, keepdim=True)
+            p_c    = p - p.mean()
+            cov    = (n_c * p_c).mean(dim=0)                   # (256,)
+            std_n  = norms.std(dim=0).clamp(min=1e-8)
+            std_p  = prog.std().clamp(min=1e-8)
+            parts.append((cov / (std_n * std_p)).abs())
+        weights = torch.stack(parts).mean(dim=0)
+
+    elif method == 'activation':
+        parts = []
+        for sp in all_spatial:
+            parts.append(sp.norm(dim=-1).mean(dim=0))          # (256,)
+        weights = torch.stack(parts).mean(dim=0)
+
+    elif method == 'slot_attention':
+        import torch.nn.functional as F_sa
+        n_slots = 4
+        D = all_spatial[0].shape[-1]
+
+        # 모든 demo 토큰을 합쳐서 (N_total, D)
+        all_tokens = torch.cat([sp.reshape(-1, D) for sp in all_spatial], dim=0)
+
+        # PCA로 slot 초기화 (task-relevant 방향)
+        _, _, V = torch.pca_lowrank(all_tokens, q=n_slots, niter=4)
+        slots = F_sa.normalize(V.T, dim=-1)  # (n_slots, D)
+
+        # Iterative slot competition (3회)
+        for _ in range(3):
+            attn = F_sa.softmax(
+                torch.einsum('nd,kd->nk', F_sa.normalize(all_tokens, dim=-1), slots),
+                dim=-1)                                         # (N, n_slots)
+            slot_sum = torch.einsum('nk,nd->kd', attn, all_tokens)
+            slots = F_sa.normalize(slot_sum / attn.sum(0).unsqueeze(-1).clamp(min=1e-8), dim=-1)
+
+        # 시간적으로 가장 많이 변하는 slot 선택 (task-relevant)
+        slot_var = torch.zeros(n_slots)
+        for sp in all_spatial:
+            T_s, P, _ = sp.shape
+            a = F_sa.softmax(
+                torch.einsum('nd,kd->nk',
+                             F_sa.normalize(sp.reshape(-1, D), dim=-1), slots),
+                dim=-1).reshape(T_s, P, n_slots)
+            slot_var += a.var(dim=0).mean(dim=0)               # (n_slots,)
+        best_slot = int(slot_var.argmax())
+
+        # 선택된 slot의 attention을 토큰 가중치로
+        w_sum = torch.zeros(256)
+        for sp in all_spatial:
+            T_s, P, _ = sp.shape
+            a = F_sa.softmax(
+                torch.einsum('nd,kd->nk',
+                             F_sa.normalize(sp.reshape(-1, D), dim=-1), slots),
+                dim=-1).reshape(T_s, P, n_slots)
+            w_sum += a[:, :, best_slot].mean(dim=0)            # (256,)
+        weights = w_sum / len(all_spatial)
+        if is_main():
+            log.info(f"[slot_attention] best_slot={best_slot}  slot_var={slot_var.tolist()}")
+
+    else:
+        raise ValueError(f"Unknown spatial pooling method: {method}")
+
+    if top_k < 256:
+        mask = torch.zeros(256)
+        mask[weights.topk(top_k).indices] = 1.0
+        weights = weights * mask
+
+    weights = weights / weights.sum().clamp(min=1e-8)
+    if is_main():
+        log.info(f"[spatial_weights] method={method}  top_k={top_k}  "
+                 f"non-zero={int((weights > 0).sum())}")
+    return weights
+
+
+@torch.no_grad()
 def reward_model_reward(z_history, z_goal, reward_model, device):
     """
     Temporal Transformer reward: sample_traj(z_history) → SWMRewardModel → P(success)
@@ -386,7 +510,7 @@ def reward_model_reward(z_history, z_goal, reward_model, device):
 @torch.no_grad()
 def load_initial_states(demo_dir, task, encoder, max_demos, device, dtype,
                         reward_type='graph', transition=None, rollout_steps=64,
-                        n_goals=1):
+                        n_goals=1, token_weights=None):
     """
     데모 첫 프레임을 인코딩.
 
@@ -471,7 +595,10 @@ def load_initial_states(demo_dir, task, encoder, max_demos, device, dtype,
                 goal_latents = []
                 for idx in indices:
                     goal_t = transform(imgs[idx]).unsqueeze(0).to(device)
-                    goal_latents.append(encoder(goal_t).to(dtype).cpu())
+                    if token_weights is not None:
+                        goal_latents.append(encoder.encode_weighted(goal_t, token_weights).to(dtype).cpu())
+                    else:
+                        goal_latents.append(encoder(goal_t).to(dtype).cpu())
                 # single goal → Tensor, multi-goal → list[Tensor]
                 init_goals.append(goal_latents[0] if n_goals == 1 else goal_latents)
 
@@ -667,18 +794,8 @@ def main():
     reward_metric = cfg.get('reward_metric', 'cosine')
     phase_threshold = cfg.get('phase_threshold', None)
     reward_aggregation = cfg.get('reward_aggregation', 'mean')
-    if is_main():
-        log.info(f"Pre-encoding initial states ...  reward_type={reward_type}")
-    # transition_l2: rollout_steps = n_rollout_chunks × NUM_ACTIONS_CHUNK
-    rollout_steps = cfg.training.n_rollout_chunks * NUM_ACTIONS_CHUNK
-    n_goals = cfg.get('n_goals', 1)
-    init_images, init_latents, init_goals = load_initial_states(
-        cfg.data_root, task, encoder, cfg.training.max_demos, device, dtype,
-        reward_type=reward_type,
-        transition=transition,
-        rollout_steps=rollout_steps,
-        n_goals=n_goals,
-    )
+    spatial_pooling = cfg.get('spatial_pooling', 'mean')
+    spatial_top_k   = cfg.get('spatial_top_k', 64)
 
     # ── PCA fit (pca_cosine / pca_delta_cosine) ──────────────────────────────
     demo_pca = None
@@ -690,6 +807,30 @@ def main():
             cfg.data_root, task, encoder, cfg.training.max_demos,
             device, dtype, n_components=n_pca
         )
+
+    # ── Spatial token weights (variance / correlation / activation) ───────────
+    token_weights = None
+    if spatial_pooling in ('variance', 'correlation', 'activation', 'slot_attention'):
+        if is_main():
+            log.info(f"Computing spatial weights (method={spatial_pooling}, top_k={spatial_top_k}) ...")
+        token_weights = compute_spatial_weights(
+            cfg.data_root, task, encoder, cfg.training.max_demos,
+            device, dtype, method=spatial_pooling, top_k=spatial_top_k,
+        )
+
+    if is_main():
+        log.info(f"Pre-encoding initial states ...  reward_type={reward_type}")
+    # transition_l2: rollout_steps = n_rollout_chunks × NUM_ACTIONS_CHUNK
+    rollout_steps = cfg.training.n_rollout_chunks * NUM_ACTIONS_CHUNK
+    n_goals = cfg.get('n_goals', 1)
+    init_images, init_latents, init_goals = load_initial_states(
+        cfg.data_root, task, encoder, cfg.training.max_demos, device, dtype,
+        reward_type=reward_type,
+        transition=transition,
+        rollout_steps=rollout_steps,
+        n_goals=n_goals,
+        token_weights=token_weights,
+    )
 
     # ── Reward model 로딩 (reward_type='reward_model'일 때만) ─────────────────
     rm = None

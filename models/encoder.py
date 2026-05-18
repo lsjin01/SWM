@@ -168,3 +168,14 @@ class SWMEncoder(nn.Module):
         """image (B,3,H,W) → global z_t (B, latent_dim) [transition / reward 전용]"""
         z = self.proj(self.backbone(image))
         return z.float()
+
+    def encode_weighted(self, image: torch.Tensor, token_weights: torch.Tensor) -> torch.Tensor:
+        """
+        token_weights: (256,) normalized weights, task-relevant tokens에 높은 값
+        → weighted z: (B, latent_dim)
+        """
+        spatial = self.backbone.forward_spatial(image)  # (B, 256, 2176)
+        w = token_weights.to(spatial.device, dtype=spatial.dtype)
+        w = w / w.sum().clamp(min=1e-8)
+        z = (spatial * w.unsqueeze(0).unsqueeze(-1)).sum(dim=1)  # (B, 2176)
+        return self.proj(z.float())
