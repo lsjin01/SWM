@@ -334,64 +334,6 @@ def _get_transform():
     return T.ToTensor()  # center_crop_and_resize가 이미 224×224 PIL 반환
 
 
-@torch.no_grad()
-def get_action_chunk_spatial(
-    encoder,
-    vla,
-    processor,
-    image_np: np.ndarray,
-    instruction: str,
-    unnorm_key: str,
-    device: torch.device,
-    chunk_size: int = 8,
-) -> np.ndarray:
-    """
-    SWM spatial 파이프라인 — vision_backbone monkey-patch 방식.
-
-    1. processor로 input_ids / attention_mask 준비 (pixel_values는 더미)
-    2. SWM encode_spatial → (1, 256, 2176) 산출
-    3. vision_backbone.forward를 임시 교체 → projector가 SWM features 받음
-    4. predict_action 정상 호출 (special token, action decoding 모두 보존)
-    """
-    pil   = center_crop_and_resize(image_np)
-    img_t = _get_transform()(pil).unsqueeze(0).to(device)
-
-    # SWM spatial features — frozen DINOv2+SigLIP (projector input dim = 2176)
-    vb_dtype = next(vla.vision_backbone.parameters()).dtype
-    swm_feats = encoder.encode_spatial(img_t).to(device, vb_dtype)  # (1, 256, 2176)
-
-    # processor로 tokenize (pixel_values는 monkey-patch이 무시하므로 더미)
-    prompt = f"In: What action should the robot take to {instruction}?\nOut:"
-    inputs = processor(prompt, pil, return_tensors="pt")
-    inputs = {k: v.to(device, dtype=torch.bfloat16)
-              if torch.is_floating_point(v) else v.to(device)
-              for k, v in inputs.items()}
-
-    # vision_backbone.forward를 SWM features 반환으로 임시 교체
-    _orig_vb_forward = vla.vision_backbone.forward
-
-    def _swm_vb_forward(pixel_values, *args, **kwargs):
-        return swm_feats
-
-    vla.vision_backbone.forward = _swm_vb_forward
-    try:
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            result = vla.predict_action(
-                **inputs,
-                unnorm_key=unnorm_key,
-                do_sample=False,
-            )
-        actions = result[0] if isinstance(result, tuple) else result
-    finally:
-        vla.vision_backbone.forward = _orig_vb_forward
-
-    if isinstance(actions, torch.Tensor):
-        actions = actions.float().cpu().numpy()
-    if actions.ndim == 1:
-        actions = np.tile(actions[np.newaxis], (chunk_size, 1))
-    return actions[:chunk_size]
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Evaluation loop
 # ─────────────────────────────────────────────────────────────────────────────
@@ -406,7 +348,6 @@ def evaluate(
     device_str: str = "cuda",
     save_json: str = None,
     chunk_size: int = 8,
-    use_z_bypass: bool = True,
 ):
     task_cfg    = TASK_CONFIG[task]
     device      = torch.device(device_str)
@@ -431,17 +372,11 @@ def evaluate(
         print(f"[Eval] unnorm_key '{unnorm_key}' not found, using '{fallback}'")
         unnorm_key = fallback
 
-    if use_z_bypass:
-        print(f"[Eval] spatial mode: SWM encode_spatial → vision_backbone monkey-patch → predict_action")
-    else:
-        print(f"[Eval] pixel mode: image→VLA.predict_action (SFT baseline)")
-
     # ── Load initial states ───────────────────────────────────────────────
     all_states = load_initial_states(task)
     n_episodes = min(n_episodes, len(all_states))
     print(f"\n{'='*60}")
     print(f"Task: {task}  Episodes: {n_episodes}  Device: {device}")
-    print(f"z_bypass={use_z_bypass}")
     print(f"{'='*60}")
 
     # ── Environment ───────────────────────────────────────────────────────
@@ -461,14 +396,7 @@ def evaluate(
             img = get_image(obs)
 
             # action chunk 생성
-            if use_z_bypass:
-                actions = get_action_chunk_spatial(
-                    encoder, vla, processor, img,
-                    instruction, unnorm_key, device,
-                    chunk_size=chunk_size,
-                )
-            else:
-                actions = get_action_chunk(
+            actions = get_action_chunk(
                 vla, processor, img,
                 instruction, unnorm_key, device,
                 chunk_size=chunk_size,
@@ -526,7 +454,6 @@ def evaluate(
         "n_success":     n_success,
         "mean_steps":    float(mean_steps),
         "total_time_s":  float(total_time),
-        "use_z_bypass":  use_z_bypass,
         "timestamp":     datetime.now().isoformat(),
     }
 
@@ -555,7 +482,6 @@ if __name__ == "__main__":
     device_str  = os.environ.get("VLA_DEVICE", "cuda")
     save_json   = os.environ.get("SAVE_JSON", "")
     chunk_size  = int(os.environ.get("CHUNK_SIZE", 8))
-    use_z_bypass = os.environ.get("USE_Z_BYPASS", "1") != "0"
 
     if not vla_base:
         print("ERROR: VLA_BASE 환경변수를 설정하세요.")
@@ -571,5 +497,4 @@ if __name__ == "__main__":
         device_str   = device_str,
         save_json    = save_json or None,
         chunk_size   = chunk_size,
-        use_z_bypass = use_z_bypass,
     )

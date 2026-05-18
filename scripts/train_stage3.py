@@ -276,36 +276,96 @@ def transition_l2_reward(z_history, z_goal_transition, device):
     return -(z_final - z_g).norm(dim=-1).mean().item()
 
 
+def _pca_project(z, pca):
+    """numpy array (1, D) or (D,) → PCA projected tensor (1, K)"""
+    z_np = z.float().cpu().numpy().reshape(1, -1)
+    return torch.tensor(pca.transform(z_np), dtype=torch.float32)
+
+
 @torch.no_grad()
-def latent_reward(z_history, z_goal, device, metric='cosine', z_init=None):
+def latent_reward(z_history, z_goal, device, metric='cosine', z_init=None, pca=None,
+                  phase_threshold=None, aggregation='mean'):
     """
     Reward = normalized cosine progress at ENDPOINT (z_T only) toward goal(s).
 
-    z_goal: Tensor(1, D)         → single goal  (n_goals=1)
-            list[Tensor(1, D)]   → multi-goal   (n_goals=K)
-              average reward across K goals (endpoint only)
-
-    reward = (cos(z_T, goal_k) - cos(z_init, goal_k)) / (1 - cos(z_init, goal_k))
+    phase_threshold: float or None. If set, binarize each goal's progress:
+                     1.0 if progress > threshold, else 0.0 (direction 1)
+    aggregation:     'mean' (default) or 'max' — how to combine multi-goal rewards (direction 2)
     """
     if len(z_history) == 0:
         return 0.0
 
-    # Multi-goal: recurse per goal and average
+    # Multi-goal: recurse per goal, optionally binarize, then aggregate
     if isinstance(z_goal, (list, tuple)):
-        rewards = [latent_reward(z_history, g, device, metric, z_init) for g in z_goal]
+        rewards = [latent_reward(z_history, g, device, metric, z_init, pca) for g in z_goal]
+        if phase_threshold is not None:
+            rewards = [1.0 if r > phase_threshold else 0.0 for r in rewards]
+        if aggregation == 'max':
+            return float(max(rewards))
         return float(sum(rewards) / len(rewards))
 
-    z_g = z_goal.float().to(device)
-    z_final = z_history[-1].float().to(device)
+    # PCA projection (CPU)
+    if pca is not None:
+        z_final_raw = z_history[-1].float()
+        z_final = _pca_project(z_final_raw, pca).to(device)
+        z_g     = _pca_project(z_goal.float(), pca).to(device)
+        z_i     = _pca_project(z_init.float(), pca).to(device) if z_init is not None else None
+    else:
+        z_final = z_history[-1].float().to(device)
+        z_g     = z_goal.float().to(device)
+        z_i     = z_init.float().to(device) if z_init is not None else None
+
     if metric == 'cosine':
-        if z_init is not None:
-            cos_0 = F.cosine_similarity(z_init.float().to(device), z_g).mean().item()
+        if z_i is not None:
+            cos_0 = F.cosine_similarity(z_i, z_g).mean().item()
             denom = max(1.0 - cos_0, 1e-4)
             cos_T = F.cosine_similarity(z_final, z_g).mean().item()
             return (cos_T - cos_0) / denom
         return F.cosine_similarity(z_final, z_g).mean().item()
+    elif metric == 'delta_cosine':
+        # cos(z_T - z_0, z_goal - z_0): 변화 방향 비교
+        # pca=None이면 전체 latent, pca!=None이면 PCA 공간에서 delta
+        if z_i is None:
+            return 0.0
+        dz_T    = z_final - z_i
+        dz_goal = z_g - z_i
+        return F.cosine_similarity(dz_T, dz_goal).mean().item()
     else:
         return -(z_final - z_g).norm(dim=-1).mean().item()
+
+
+def fit_demo_pca(demo_dir, task, encoder, max_demos, device, dtype, n_components=16, stride=2):
+    """
+    demo 전체 프레임을 인코딩해 PCA fit → task-relevant subspace 추출.
+    반환: sklearn PCA object (CPU-side, numpy 기반)
+    """
+    import h5py
+    from torchvision import transforms
+    from sklearn.decomposition import PCA as SklearnPCA
+
+    hdf5 = os.path.join(
+        demo_dir, 'demos', 'core_datasets', task,
+        f'demo_src_{task}_task_D0', 'demo.hdf5'
+    )
+    transform = transforms.Compose([
+        transforms.ToPILImage(), transforms.Resize((224, 224)), transforms.ToTensor(),
+    ])
+    all_z = []
+    with h5py.File(hdf5, 'r') as f:
+        demos = sorted(f['data'].keys())[:max_demos]
+        for dn in demos:
+            imgs = f[f'data/{dn}/obs/agentview_image']
+            for i in range(0, len(imgs), stride):
+                t = transform(np.array(imgs[i])).unsqueeze(0).to(device)
+                z = encoder(t).float().cpu().squeeze(0).numpy()
+                all_z.append(z)
+    all_z = np.stack(all_z)   # (N, 2176)
+    pca = SklearnPCA(n_components=n_components)
+    pca.fit(all_z)
+    cumvar = float(np.sum(pca.explained_variance_ratio_) * 100)
+    log.info(f"Demo PCA fit: {len(all_z)} frames → top-{n_components} dims  "
+             f"cumulative variance={cumvar:.1f}%")
+    return pca
 
 
 @torch.no_grad()
@@ -382,8 +442,28 @@ def load_initial_states(demo_dir, task, encoder, max_demos, device, dtype,
                 imgs = f[f'data/{dn}/obs/agentview_image']
                 T_demo = len(imgs)
                 if n_goals == 1:
-                    # single goal: last frame only (backward compatible)
                     indices = [T_demo - 1]
+                elif n_goals == 'action':
+                    # action velocity 기반 phase 감지:
+                    # ||a_t - a_{t-1}|| 피크 = task 전환 순간 → goal frame으로 사용
+                    acts = np.array(f[f'data/{dn}/actions'])    # (T, 7)
+                    vel  = np.linalg.norm(np.diff(acts, axis=0), axis=1)  # (T-1,)
+                    # gaussian smoothing으로 noise 제거
+                    from scipy.ndimage import gaussian_filter1d
+                    vel_smooth = gaussian_filter1d(vel, sigma=3.0)
+                    # 균등 분할된 K=4 구간에서 각 구간 내 최대 피크 선택
+                    K = 4
+                    seg_len = max(1, (T_demo - 1) // K)
+                    indices = []
+                    for k in range(K):
+                        lo = k * seg_len
+                        hi = (k + 1) * seg_len if k < K - 1 else T_demo - 1
+                        seg = vel_smooth[lo:hi]
+                        if len(seg) == 0:
+                            indices.append(min(lo + seg_len // 2, T_demo - 1))
+                        else:
+                            peak_in_seg = int(np.argmax(seg)) + lo + 1  # +1: diff offset
+                            indices.append(min(peak_in_seg, T_demo - 1))
                 else:
                     # K goals uniformly sampled: 1/K, 2/K, ..., K/K of demo
                     indices = [max(0, int(round((k + 1) * (T_demo - 1) / n_goals)))
@@ -585,6 +665,8 @@ def main():
     # ── Initial states (images + global latents + goals) ─────────────────────
     reward_type = cfg.get('reward_type', 'graph')
     reward_metric = cfg.get('reward_metric', 'cosine')
+    phase_threshold = cfg.get('phase_threshold', None)
+    reward_aggregation = cfg.get('reward_aggregation', 'mean')
     if is_main():
         log.info(f"Pre-encoding initial states ...  reward_type={reward_type}")
     # transition_l2: rollout_steps = n_rollout_chunks × NUM_ACTIONS_CHUNK
@@ -597,6 +679,17 @@ def main():
         rollout_steps=rollout_steps,
         n_goals=n_goals,
     )
+
+    # ── PCA fit (pca_cosine / pca_delta_cosine) ──────────────────────────────
+    demo_pca = None
+    if reward_metric in ('pca_cosine', 'pca_delta_cosine'):
+        n_pca = cfg.get('pca_components', 16)
+        if is_main():
+            log.info(f"Fitting demo PCA (n_components={n_pca}) ...")
+        demo_pca = fit_demo_pca(
+            cfg.data_root, task, encoder, cfg.training.max_demos,
+            device, dtype, n_components=n_pca
+        )
 
     # ── Reward model 로딩 (reward_type='reward_model'일 때만) ─────────────────
     rm = None
@@ -682,8 +775,19 @@ def main():
                 if reward_type == 'transition_l2':
                     rew = transition_l2_reward(z_hist, goal, device)
                 elif reward_type == 'latent':
-                    rew = latent_reward(z_hist, goal, device, metric=reward_metric,
-                                        z_init=z0.cpu() if reward_metric == 'cosine' else None)
+                    use_pca = demo_pca if reward_metric in ('pca_cosine', 'pca_delta_cosine') else None
+                    if reward_metric == 'pca_cosine':
+                        actual_metric = 'cosine'
+                    elif reward_metric == 'pca_delta_cosine':
+                        actual_metric = 'delta_cosine'
+                    else:
+                        actual_metric = reward_metric
+                    rew = latent_reward(z_hist, goal, device,
+                                        metric=actual_metric,
+                                        z_init=z0.cpu(),
+                                        pca=use_pca,
+                                        phase_threshold=phase_threshold,
+                                        aggregation=reward_aggregation)
                 elif reward_type == 'reward_model':
                     rew = reward_model_reward(z_hist, goal, rm, device)
                 else:

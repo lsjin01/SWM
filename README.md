@@ -32,10 +32,18 @@ swm/
 ├── configs/
 │   ├── stage1_multitask_dinosiglip.yaml
 │   ├── stage2_multitask_dinosiglip.yaml
-│   ├── stage2_5_v3.yaml               # Temporal Reward Model
-│   ├── stage3_latent_cos.yaml         # Normalized cosine reward
-│   ├── stage3_latent_cos_temporal.yaml    # Temporal progress reward
-│   └── stage3_latent_cos_temporal_v2.yaml # + n_states×4, iter 300
+│   ├── stage2_5_v3.yaml                    # Temporal Reward Model
+│   ├── stage3_latent_cos.yaml              # Normalized cosine, endpoint (best: 24%)
+│   ├── stage3_latent_cos_temporal.yaml     # Temporal progress reward (10%)
+│   ├── stage3_multi_goal.yaml              # Uniform 4-goal endpoint (20%)
+│   ├── stage3_pca_goal.yaml                # PCA cosine, n_goals=4 (20%)
+│   ├── stage3_pca_goal_single.yaml         # PCA cosine, n_goals=1 (16%)
+│   ├── stage3_pca_delta.yaml               # PCA delta cosine, n_goals=1
+│   ├── stage3_action_goal.yaml             # Action-velocity based phase detection
+│   ├── stage3_pca_binary.yaml              # PCA binary phase reward (dir.1)
+│   ├── stage3_diversity.yaml               # High-temperature rollout diversity (dir.4)
+│   ├── stage3_pca_max.yaml                 # PCA max-progress aggregation (dir.2)
+│   └── stage3_action_pca_delta.yaml        # Action goal + PCA delta (dir.3)
 ├── models/
 │   ├── encoder.py       # SWMEncoder (DINOv2 + SigLIP, freeze_backbone=True)
 │   ├── transition.py    # SWMTransition (latent=2176, hidden=512, layers=6)
@@ -45,9 +53,12 @@ swm/
 │   ├── train_stage1.py
 │   ├── train_stage2.py
 │   ├── train_stage2_5.py  # Temporal RM training
-│   └── train_stage3.py    # GRPO fine-tuning
+│   ├── train_stage3.py    # GRPO fine-tuning
+│   ├── analyze_latent_inflection.py    # Δz / curvature 분석
+│   ├── analyze_pca_latent.py           # PCA fit & goal separation 분석
+│   └── analyze_pca_generalization.py   # train/test PCA 일반화 분석
 └── eval/
-    └── eval_swm_mimicgen.py  # MimicGen simulator evaluation
+    └── eval_swm_mimicgen.py  # MimicGen simulator evaluation (pixel mode only)
 ```
 
 ---
@@ -61,16 +72,19 @@ python scripts/train_stage1.py --config configs/stage1_multitask_dinosiglip.yaml
 # Stage 2: Transition
 python scripts/train_stage2.py --config configs/stage2_multitask_dinosiglip.yaml
 
-# Stage 3: GRPO (multi-goal endpoint reward, n_goals=4)
+# Stage 3: GRPO (예: latent_cos endpoint)
 export CUDA_VISIBLE_DEVICES=2,3,7
 torchrun --nproc_per_node=3 --master_port=29507 \
     scripts/train_stage3.py \
-    --config configs/stage3_multi_goal.yaml
+    --config configs/stage3_latent_cos.yaml
 
-# Eval (USE_Z_BYPASS=0 필수 — 학습 전용 최적화)
-USE_Z_BYPASS=0 CUDA_VISIBLE_DEVICES=2 \
-TASK=square CKPT_PATH=outputs/stage3/multi_goal/square/best.pt \
-bash eval/run_eval.sh
+# Eval (pixel mode — z_bypass 완전 제거됨)
+CUDA_VISIBLE_DEVICES=2 TASK=square \
+  CKPT_PATH=outputs/stage3/latent_cos/square/best.pt \
+  STAGE1_CKPT=outputs/stage1/multitask_dinosiglip/best.pt \
+  STAGE2_CKPT=outputs/stage2/multitask_dinosiglip/best.pt \
+  VLA_BASE=<SFT_model_path> VLA_DEVICE=cuda N_EPISODES=50 \
+  python eval/eval_swm_mimicgen.py
 ```
 
 ---
@@ -87,15 +101,23 @@ bash eval/run_eval.sh
 
 ### SWM 실험 결과
 
-| # | 실험 | reward 설계 | SR | 비고 |
-|---|------|------------|-----|------|
-| 1 | Stage 3 초기 | graph distance | 10% | projector 학습됨 → feature drift |
-| 2 | Stage 3 freeze_proj | graph distance | 10% | projector 고정. reward 설계 문제 |
-| 3 | Stage 3 temporal_rm | temporal RM | —  | reward=0.0003 고정, GRPO 동작 안 함 |
-| 4 | Stage 3 latent_cos (절대값) | cos(z_T, z_goal) | — | reward=0.97 고정, variance 없음 |
-| 5 | **Stage 3 latent_cos (정규화)** | (cos_T − cos_0)/(1−cos_0) | **24%** | SFT 대비 +8%p, WMPO P128 동등 |
-| 6 | Stage 3 latent_cos_temporal | trajectory 전체 평균 progress | **10%** | 정규화 endpoint(24%)보다 열등 — variance 희석 |
-| 7 | Stage 3 multi_goal (n_goals=4) | endpoint, K=4 중간 목표 평균 | TBD | 현재 학습 중 |
+| # | 실험 | reward 설계 | SR (best) | SR (last) | 비고 |
+|---|------|------------|-----------|-----------|------|
+| 1 | Stage 3 초기 | graph distance | 10% | — | projector 학습됨 → feature drift |
+| 2 | freeze_proj | graph distance | 10% | — | projector 고정. reward 설계 문제 |
+| 3 | temporal_rm | temporal RM | — | — | reward=0.0003 고정, GRPO 동작 안 함 |
+| 4 | latent_cos (절대값) | cos(z_T, z_goal) | — | — | reward=0.97 고정, variance 없음 |
+| 5 | **latent_cos (정규화)** | (cos_T−cos_0)/(1−cos_0), n_goals=1 | **24%** | **24%** | SFT +8%p, WMPO P128 동등 |
+| 6 | latent_cos_temporal | trajectory 전체 평균 progress | 10% | 10% | variance 희석, endpoint보다 열등 |
+| 7 | multi_goal (uniform) | endpoint, K=4 균등 goal 평균 | 20% | 18% | n_goals=4 (25/50/75/100%) |
+| 8 | pca_goal (n_goals=4) | PCA-16 투영 후 cosine progress, K=4 | 20% | 12% | goal 분리도 0.97→0.05 |
+| 9 | pca_goal_single (n_goals=1) | PCA-16 투영 후 cosine progress, K=1 | 16% | 16% | PCA 단일 goal = SFT 동등 |
+| 10 | action_goal | action velocity 기반 phase 탐지, K=4 | TBD | TBD | 실험 진행 중 |
+| 11 | pca_delta | PCA 공간 delta 방향 비교 | TBD | TBD | 실험 진행 중 |
+| 12 | pca_binary (dir.1) | PCA phase binary threshold=0.3 | TBD | TBD | 예정 |
+| 13 | diversity (dir.4) | temperature=2.0, endpoint | TBD | TBD | 예정 |
+| 14 | pca_max (dir.2) | PCA max-progress aggregation | TBD | TBD | 예정 |
+| 15 | action_pca_delta (dir.3) | action goal + PCA delta | TBD | TBD | 예정 |
 
 ---
 
@@ -111,52 +133,90 @@ bash eval/run_eval.sh
 - `reward = cos_sim(z_T, z_goal)`
 - 문제: z_init과 z_goal이 이미 cosine sim≈0.97 → 모든 rollout reward 동일
 
-### 현재 방식 (Multi-goal Endpoint Progress)
+**Multi-goal (uniform) — latent 공간 goal 분리 실패**
+- 2176-dim 전체 latent 공간에서 25/50/75/100% 프레임의 goal inter-similarity = 0.97+
+- 4개 goal이 사실상 동일 → reward variance=0 → GRPO 학습 실패
+- 재평가(z_bypass 버그 수정 후): best 20%, last 18%
 
-```python
-# demo 궤적에서 K개 중간 목표 균등 샘플링 (25%, 50%, 75%, 100%)
-# 각 목표에 대해 endpoint z_T의 progress 측정
-for goal_k in [z_25, z_50, z_75, z_100]:
-    progress_k = (cos(z_T, goal_k) - cos(z_init, goal_k)) / (1 - cos(z_init, goal_k))
+### Latent Indistinguishability 분석
 
-reward = mean_k(progress_k)
+```
+DINOv2+SigLIP 2176-dim 공간의 문제:
+  - goal 간 cosine similarity: 0.97+ (goal 4개가 거의 동일)
+  - Δz norm: ~0.002 (매우 작음)
+  - 곡률(curvature) mean=0.85~0.93 (random orthogonality에 가까움)
+
+PCA top-16 적용 시:
+  - explained variance: 73.2% (task-relevant 차원만 보존)
+  - goal 간 cosine similarity: 0.05~0.08 (잘 분리됨)
+  - train/test 일반화: held-out demo에서도 동일한 separation
 ```
 
-- `reward=0`: 제자리 (아무 progress 없음)
-- `reward=1`: 모든 중간 목표에 완전 도달
-- 실제 범위: −0.05 ~ 0.5 (다양한 목표로 인해 variance 증가 기대)
+### 현재 방식 (Endpoint Progress + PCA)
 
-### 이전 방식 비교
+```python
+# PCA 투영 후 cosine progress (pca_cosine)
+z_pca = pca.transform(z)           # 2176-dim → 16-dim
+progress_k = (cos(z_T_pca, goal_k_pca) - cos(z_0_pca, goal_k_pca)) /
+             (1 - cos(z_0_pca, goal_k_pca))
+reward = mean_k(progress_k)        # or max_k for pca_max
 
-| 방식 | reward 계산 | SR |
-|------|------------|-----|
-| endpoint (n_goals=1) | `(cos_T − cos_0)/(1−cos_0)` | 24% |
-| temporal average | `mean_t[(cos_t − cos_0)/(1−cos_0)]` | 10% ↓ |
-| **multi-goal endpoint (n_goals=4)** | `mean_k endpoint progress` | TBD |
+# PCA delta cosine (pca_delta_cosine)
+dz_T    = z_T_pca - z_0_pca
+dz_goal = z_goal_pca - z_0_pca
+reward  = cos(dz_T, dz_goal)       # 변화 방향 유사도
+
+# Binary phase reward (pca_binary, phase_threshold=0.3)
+binary_k = 1.0 if progress_k > 0.3 else 0.0
+reward   = mean_k(binary_k)        # → {0, 0.25, 0.5, 0.75, 1.0}
+```
+
+### 방식 비교 (확정된 결과)
+
+| 방식 | 핵심 아이디어 | SR (best) |
+|------|------------|-----------|
+| endpoint (n_goals=1) | `(cos_T − cos_0)/(1−cos_0)` | **24%** |
+| temporal average | `mean_t[progress_t]` | 10% ↓ |
+| multi-goal uniform (n_goals=4) | `mean_k[progress_k]`, 2176-dim | 20% |
+| pca_goal (n_goals=4) | `mean_k[progress_k]`, PCA-16 | 20% |
+| pca_goal_single (n_goals=1) | `progress`, PCA-16 | 16% |
+
+### 개선 방향 (chain7~10, 진행 중)
+
+GRPO 핵심 문제 = **within-group reward variance 부족** (std≈0.07~0.08, 8 rollout이 거의 동일한 reward 수령)
+
+| 방향 | 아이디어 | config |
+|------|---------|--------|
+| Dir.1 | Binary phase reward: progress_k > 0.3 → 1.0 | `pca_binary` |
+| Dir.2 | Max-progress: mean → max aggregation | `pca_max` |
+| Dir.3 | Action-goal + PCA delta 조합 | `action_pca_delta` |
+| Dir.4 | Temperature 2.0 → rollout 다양성 증가 | `diversity` |
 
 ---
 
 ## 주요 발견 및 교훈
 
-1. **z_bypass는 학습 전용** — eval에서 USE_Z_BYPASS=True 사용 시 항상 SR=0%. eval은 반드시 native VLA pipeline 사용.
+1. **z_bypass는 eval에서 완전 제거** — eval script에서 `use_z_bypass` 관련 코드 삭제. 항상 pixel mode(native VLA pipeline) 사용.
 
 2. **freeze_projector=True 필수** — projector를 학습시키면 visual feature가 drift되어 성능 저하.
 
-3. **reward variance가 핵심** — GRPO는 그룹 내 reward variance로 advantage를 계산하므로, 모든 rollout이 동일한 reward를 받으면 gradient=0.
+3. **reward variance가 핵심** — GRPO는 그룹 내 reward variance로 advantage를 계산하므로, 모든 rollout이 동일한 reward를 받으면 gradient=0. latent_cos std≈0.07, 학습 전반에 걸쳐 reward 거의 flat.
 
 4. **z_init 정규화** — cosine similarity의 절대값이 아닌 초기 상태 대비 상대적 progress를 측정해야 의미있는 학습 signal 생성.
 
-5. **Temporal averaging HURTS** — 궤적 160 step 전체 평균은 per-rollout variance를 희석 → GRPO signal 약화(10%). endpoint(z_T only)가 더 좋음(24%).
+5. **Temporal averaging HURTS** — 궤적 전체 평균은 per-rollout variance를 희석 → GRPO signal 약화(10%). endpoint(z_T only)가 더 좋음(24%).
 
-6. **Multi-goal endpoint** — K개 중간 목표에 대해 각각 endpoint progress를 계산 후 평균. variance 유지 + curriculum signal 추가.
+6. **PCA top-16으로 latent 분리도 개선** — 2176-dim 공간에서 goal sim=0.97+이던 것이 PCA-16에서 0.05~0.08로 감소. 그러나 SR 개선은 미미 (pca_goal: 20% = multi_goal 동등). reward variance 문제가 근본 원인.
+
+7. **GRPO learning signal 미약** — 200 iter 학습에서 reward mean이 초반~후반 거의 동일 (latent_cos: 0.12→0.11, pca_goal: -0.02→+0.005). loss도 flat (~0.09). 7B 모델 fine-tuning에 더 강한 signal 필요.
 
 ---
 
 ## Hardware
 
-- GPU: 3× (183 GB VRAM)
-- 학습: torchrun --nproc_per_node=3
-- 평가: single GPU
+- GPU: 3× B200 (183 GB VRAM each)
+- 학습: torchrun --nproc_per_node=3, GPU 2,3,7
+- 평가: single GPU (GPU 2 or 3)
 
 ## Citation
 

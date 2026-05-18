@@ -1,0 +1,39 @@
+# Direction 3: action_goal + PCA delta cosine
+# action velocity 기반 phase 경계 탐지 + PCA 공간에서 delta 방향 비교
+# 가장 informative한 phase 전환점을 goal로, PCA로 방향 측정
+experiment:
+  name: swm_stage3_action_pca_delta_square
+  seed: 42
+  output_dir: outputs/stage3/action_pca_delta/square
+
+task: square
+unnorm_key: square_d0_300_demos
+
+reward_type: latent
+reward_metric: pca_delta_cosine   # PCA 공간에서 delta 방향 비교
+pca_components: 16
+n_goals: action                   # action velocity peak 기반 phase 탐지
+
+vla_path: /NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO/checkpoint_files/SFT_models/square
+swm_ckpt: outputs/stage2/multitask_dinosiglip/best.pt
+stage1_ckpt: outputs/stage1/multitask_dinosiglip/best.pt
+
+data_root: /NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO-JEPA/data
+
+training:
+  iterations: 200
+  max_demos: 300
+  n_states_per_iter: 4
+  g_rollouts: 8
+  mini_g: 2
+  n_rollout_chunks: 20
+  temperature: 1.2
+  full_finetune: false
+  freeze_projector: true
+  gradient_checkpointing: false
+  lr: 5.0e-6
+  clip_eps: 0.2
+  kl_coef: 0.05
+  grad_clip: 1.0
+  log_every: 1
+  save_every: 20
