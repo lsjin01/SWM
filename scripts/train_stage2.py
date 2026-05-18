@@ -473,11 +473,23 @@ def main():
         ckpt_r = torch.load(args.resume, map_location=device)
         raw_trans = transition.module if use_ddp else transition
         raw_trans.load_state_dict(ckpt_r["transition"])
+        if use_spatial and "spatial_proj" in ckpt_r:
+            encoder.spatial_proj.load_state_dict(ckpt_r["spatial_proj"])
+        if "optimizer" in ckpt_r:
+            optimizer.load_state_dict(ckpt_r["optimizer"])
+            # override lr with config value (lr may have changed on resume)
+            for pg in optimizer.param_groups:
+                pg["lr"] = cfg.training.lr
+        if "scheduler" in ckpt_r:
+            scheduler.load_state_dict(ckpt_r["scheduler"])
+        if "scaler" in ckpt_r:
+            scaler.load_state_dict(ckpt_r["scaler"])
         start_epoch = ckpt_r.get("epoch", 0) + 1
         best_val    = ckpt_r.get("val_loss", float("inf"))
         if is_main():
             log.info(f"Resumed from {args.resume}  "
-                     f"epoch={start_epoch-1}  val_loss={best_val:.4f}")
+                     f"epoch={start_epoch-1}  val_loss={best_val:.4f}  "
+                     f"lr_override={cfg.training.lr}")
 
     # ── Training loop ────────────────────────────────────────────────────────
     for epoch in range(start_epoch, cfg.training.epochs + 1):
@@ -520,6 +532,9 @@ def main():
                 "transition": raw_trans.state_dict(),
                 "val_loss":   vl[0],
                 "cfg":        OmegaConf.to_container(cfg),
+                "optimizer":  optimizer.state_dict(),
+                "scheduler":  scheduler.state_dict(),
+                "scaler":     scaler.state_dict(),
             }
             if use_spatial:
                 ckpt["spatial_proj"] = encoder.spatial_proj.state_dict()

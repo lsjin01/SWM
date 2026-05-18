@@ -1,7 +1,7 @@
 #!/bin/bash
-# Phase 2 Chain A-1: spatial_pca_multi_goal
+# Phase 2 Chain A-2: spatial_pca_multi_goal + attn patch weights
 # Chain A (GPU 2,3,4): 1 → 3 → 5
-# pca_adaptive goal (threshold=0.3), no patch weight baseline
+# waits for chain1 eval (eval_spatial_pca_multi_goal_best.log)
 
 WMPO_PYTHON=/home/dgist_shyo/miniconda3/envs/WMPO/bin/python3.11
 WMPO_TORCHRUN=/home/dgist_shyo/miniconda3/envs/WMPO/bin/torchrun
@@ -9,19 +9,23 @@ SWM=/home/dgist_shyo/sjLee/SWM
 export MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
 export LD_LIBRARY_PATH="/home/dgist_shyo/.mujoco/mujoco210/bin:/usr/lib/x86_64-linux-gnu:/usr/lib/nvidia:${LD_LIBRARY_PATH}"
 
-log() { echo "[CHAIN1_GPU234 $(date '+%H:%M:%S')] $*"; }
+log() { echo "[CHAIN3_GPU234 $(date '+%H:%M:%S')] $*"; }
 
-log "Starting spatial_pca_multi_goal on GPU 2,3,4 ..."
+log "Waiting for chain1 eval (eval_spatial_pca_multi_goal_best.log) ..."
+until grep -l "Success Rate" "$SWM/logs/eval_spatial_pca_multi_goal_best.log" 2>/dev/null | grep -q .; do
+    sleep 60
+done
+log "chain1 done. Starting spatial_pca_multi_goal_attn on GPU 2,3,4 ..."
 
-TRAIN_LOG="$SWM/logs/train_spatial_pca_multi_goal_$(date +%Y%m%d_%H%M%S).log"
+TRAIN_LOG="$SWM/logs/train_spatial_pca_multi_goal_attn_$(date +%Y%m%d_%H%M%S).log"
 ( cd $SWM && CUDA_VISIBLE_DEVICES=2,3,4 $WMPO_TORCHRUN \
-    --nproc_per_node=3 --master_port=29550 \
+    --nproc_per_node=3 --master_port=29552 \
     "$SWM/scripts/train_stage3.py" \
-    --config "$SWM/configs/stage3_spatial_pca_multi_goal.yaml" \
+    --config "$SWM/configs/stage3_spatial_pca_multi_goal_attn.yaml" \
     > "$TRAIN_LOG" 2>&1 )
 log "Training DONE. Log: $TRAIN_LOG"
 
-OUT="$SWM/outputs/stage3/spatial_pca_multi_goal/square"
+OUT="$SWM/outputs/stage3/spatial_pca_multi_goal_attn/square"
 log "Evaluating best(GPU2) + last(GPU3) ..."
 
 CUDA_VISIBLE_DEVICES=2 TASK=square CKPT_PATH="$OUT/best.pt" \
@@ -29,9 +33,9 @@ STAGE1_CKPT="$SWM/outputs/stage1/multitask_dinosiglip/best.pt" \
 STAGE2_CKPT="$SWM/outputs/stage2/spatial_multitask/best.pt" \
 VLA_BASE="/NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO/checkpoint_files/SFT_models/square" \
 VLA_DEVICE=cuda N_EPISODES=50 \
-SAVE_JSON="$SWM/eval_results/spatial_pca_multi_goal_best_$(date +%Y%m%d_%H%M%S).json" \
+SAVE_JSON="$SWM/eval_results/spatial_pca_multi_goal_attn_best_$(date +%Y%m%d_%H%M%S).json" \
 $WMPO_PYTHON "$SWM/eval/eval_swm_mimicgen.py" \
-> "$SWM/logs/eval_spatial_pca_multi_goal_best.log" 2>&1 &
+> "$SWM/logs/eval_spatial_pca_multi_goal_attn_best.log" 2>&1 &
 PID1=$!
 
 CUDA_VISIBLE_DEVICES=3 TASK=square CKPT_PATH="$OUT/ckpt_iter0200.pt" \
@@ -39,14 +43,14 @@ STAGE1_CKPT="$SWM/outputs/stage1/multitask_dinosiglip/best.pt" \
 STAGE2_CKPT="$SWM/outputs/stage2/spatial_multitask/best.pt" \
 VLA_BASE="/NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO/checkpoint_files/SFT_models/square" \
 VLA_DEVICE=cuda N_EPISODES=50 \
-SAVE_JSON="$SWM/eval_results/spatial_pca_multi_goal_last_$(date +%Y%m%d_%H%M%S).json" \
+SAVE_JSON="$SWM/eval_results/spatial_pca_multi_goal_attn_last_$(date +%Y%m%d_%H%M%S).json" \
 $WMPO_PYTHON "$SWM/eval/eval_swm_mimicgen.py" \
-> "$SWM/logs/eval_spatial_pca_multi_goal_last.log" 2>&1 &
+> "$SWM/logs/eval_spatial_pca_multi_goal_attn_last.log" 2>&1 &
 PID2=$!
 
 wait $PID1 $PID2
 log "Eval DONE."
 grep -h "Success Rate" \
-    "$SWM/logs/eval_spatial_pca_multi_goal_best.log" \
-    "$SWM/logs/eval_spatial_pca_multi_goal_last.log" 2>/dev/null | sed 's/^/  /'
-log "chain1 ALL DONE."
+    "$SWM/logs/eval_spatial_pca_multi_goal_attn_best.log" \
+    "$SWM/logs/eval_spatial_pca_multi_goal_attn_last.log" 2>/dev/null | sed 's/^/  /'
+log "chain3 ALL DONE."
