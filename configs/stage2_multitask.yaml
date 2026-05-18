@@ -1,0 +1,56 @@
+experiment:
+  name: swm_stage2_multitask_dinosiglip
+  seed: 42
+  output_dir: outputs/stage2/multitask_dinosiglip
+
+data:
+  data_root: /NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO-JEPA/data
+  robomimic_root: /NHNHOME/WORKSPACE/0526040052_A/sjLee/robomimic_data
+  use_robomimic: true
+  tasks:
+    - square
+    - coffee
+    - stack_three
+    - three_piece_assembly
+  image_size: 224
+  num_workers: 4
+  train_split: 0.9
+  seq_len: 16
+
+stage1_ckpt: outputs/stage1/multitask_dinosiglip/best.pt
+
+encoder:
+  latent_dim: 2176
+  vla_path: /NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO/checkpoint_files/SFT_models/square
+
+transition:
+  action_dim: 7
+  hidden_dim: 512
+  num_layers: 6
+  num_heads: 8
+  dropout: 0.1
+
+loss:
+  lambda_graph: 1.0
+  lambda_depth: 0.0
+  lambda_jepa: 1.0
+  jepa_loss: l1
+
+training:
+  epochs: 50
+  batch_size: 128
+  lr: 4.0e-4
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  amp: true
+  log_interval: 100
+  save_interval: 5
+
+  teacher_forcing:
+    initial_ratio: 1.0
+    final_ratio: 0.5
+    decay_epochs: 30
+
+  noise_injection:
+    enabled: true
+    std: 0.01

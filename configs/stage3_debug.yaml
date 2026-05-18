@@ -1,0 +1,30 @@
+experiment:
+  name: swm_stage3_debug
+  seed: 42
+  output_dir: outputs/stage3/debug/square
+
+task: square
+unnorm_key: square_d0_300_demos
+
+vla_path: /NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO/checkpoint_files/SFT_models/square
+swm_ckpt: outputs/stage2/multitask_dinosiglip/best.pt
+stage1_ckpt: outputs/stage1/multitask_dinosiglip/best.pt
+
+data_root: /NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO-JEPA/data
+
+training:
+  iterations: 2
+  max_demos: 5
+  n_states_per_iter: 1
+  g_rollouts: 2
+  mini_g: 0
+  n_rollout_chunks: 1
+  temperature: 1.6
+  full_finetune: true
+  gradient_checkpointing: true
+  lr: 5.0e-6
+  clip_eps: 0.2
+  kl_coef: 0.0
+  grad_clip: 1.0
+  log_every: 1
+  save_every: 2

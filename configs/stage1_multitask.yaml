@@ -1,0 +1,48 @@
+experiment:
+  name: swm_stage1_multitask_dinosiglip
+  seed: 42
+  output_dir: outputs/stage1/multitask_dinosiglip
+
+data:
+  data_root: /NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO-JEPA/data
+  robomimic_root: /NHNHOME/WORKSPACE/0526040052_A/sjLee/robomimic_data
+  use_robomimic: true
+  tasks:
+    - square
+    - coffee
+    - stack_three
+    - three_piece_assembly
+  image_size: 224
+  num_workers: 4
+  train_split: 0.9
+
+encoder:
+  vla_path: /NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO/checkpoint_files/SFT_models/square
+  freeze_backbone: true   # DINOv2+SigLIP frozen
+  latent_dim: 2176        # DINOv2(1024) + SigLIP(1152)
+  max_nodes: 8
+
+heads:
+  graph_head:
+    hidden_dims: [1024, 512]
+    dropout: 0.1
+  depth_head:
+    grid_size: 32
+    hidden_dims: [1024, 512]
+    dropout: 0.1
+
+loss:
+  lambda_graph: 1.0
+  lambda_depth: 0.0      # depth GT 없으므로 비활성화
+  graph_loss: smooth_l1
+
+training:
+  epochs: 30
+  batch_size: 512
+  lr: 2.0e-3             # backbone frozen이므로 heads만 높은 lr
+  lr_backbone: 0.0       # frozen
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  amp: true
+  log_interval: 100
+  save_interval: 5

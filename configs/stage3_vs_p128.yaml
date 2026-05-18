@@ -1,0 +1,48 @@
+# Stage 3 config aligned with WMPO p128 for fair comparison.
+#
+# Key matches with WMPO train_grpo_optionA (p128):
+#   full_finetune=true       : all VLA params trainable (vs LoRA-only in default stage3)
+#   gradient_checkpointing   : memory control for full fine-tune
+#   temperature=1.6          : same sampling temperature
+#   n_rollout_chunks=8       : 8 chunks × 8 sub-steps = 64 WM steps (same horizon)
+#   g_rollouts=4             : group size for GRPO advantage
+#   n_states_per_iter=2      : states sampled per iteration
+#   kl_coef=0.0              : no KL penalty (same as p128)
+#   mini_g=1                 : process 1 rollout at a time (memory-safe with full fine-tune)
+#   max_demos=300            : same demo pool size
+#
+# SWM-specific (intentionally different from p128):
+#   reward: graph distance  (vs LatentRewardModel in p128)
+#   vision: z_t bypass      (vs PatchDecoder→image→VLA in p128)
+#   world model: SWMTransition (vs V-JEPA-AC in p128)
+
+experiment:
+  name: swm_stage3_vs_p128_square
+  seed: 42
+  output_dir: outputs/stage3/vs_p128/square
+
+task: square
+unnorm_key: square_d0_300_demos
+
+vla_path: /NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO/checkpoint_files/SFT_models/square
+swm_ckpt: outputs/stage2/multitask_dinosiglip/best.pt
+stage1_ckpt: outputs/stage1/multitask_dinosiglip/best.pt
+
+data_root: /NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO-JEPA/data
+
+training:
+  iterations: 100            # matches p128 n_iterations=100
+  max_demos: 300             # matches p128 max_demos=300
+  n_states_per_iter: 2       # matches p128
+  g_rollouts: 4              # matches p128
+  mini_g: 1                  # process 1 rollout/backward (fits full fine-tune in 2 GPUs)
+  n_rollout_chunks: 8        # matches p128 (8×8=64 WM steps, same horizon)
+  temperature: 1.6           # matches p128
+  full_finetune: true        # all VLA params trainable (p128-style)
+  gradient_checkpointing: true
+  lr: 5.0e-6                 # matches p128 lr_vla
+  clip_eps: 0.2
+  kl_coef: 0.0               # matches p128 (no KL penalty)
+  grad_clip: 1.0
+  log_every: 1
+  save_every: 20

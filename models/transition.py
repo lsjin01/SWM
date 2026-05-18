@@ -111,3 +111,83 @@ class SWMTransition(nn.Module):
                 z = z_next
 
         return torch.stack(latents, dim=1)
+
+
+class SpatialSWMTransition(nn.Module):
+    """
+    Spatial action-conditioned Transformer.
+    Input:  s_t (B, N, spatial_dim) + action (B, 7)
+    Output: s_{t+1} (B, N, spatial_dim)
+
+    Action is prepended as a token → Transformer over (N+1) tokens
+    → drop action token → project to spatial_dim.
+
+    params: ~21M  (N=256, spatial_dim=256, hidden=512, layers=6)
+    """
+
+    def __init__(
+        self,
+        n_patches:   int   = 256,
+        spatial_dim: int   = 256,
+        action_dim:  int   = 7,
+        hidden_dim:  int   = 512,
+        num_layers:  int   = 6,
+        num_heads:   int   = 8,
+        dropout:     float = 0.1,
+        freeze:      bool  = False,
+    ):
+        super().__init__()
+        self.n_patches   = n_patches
+        self.spatial_dim = spatial_dim
+
+        self.token_embed  = nn.Linear(spatial_dim, hidden_dim)
+        self.action_embed = nn.Linear(action_dim, hidden_dim)
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.blocks = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+        self.norm   = nn.LayerNorm(hidden_dim)
+        self.out    = nn.Linear(hidden_dim, spatial_dim)
+
+        if freeze:
+            for p in self.parameters():
+                p.requires_grad = False
+
+        n = sum(p.numel() for p in self.parameters())
+        print(f"[SpatialSWMTransition] params: {n:,}  "
+              f"(N={n_patches}, spatial_dim={spatial_dim}, "
+              f"hidden={hidden_dim}, layers={num_layers}, heads={num_heads})")
+
+    def forward(
+        self,
+        s_t:    torch.Tensor,   # (B, N, spatial_dim)
+        action: torch.Tensor,   # (B, 7)
+    ) -> torch.Tensor:
+        """s_t + action → ŝ_{t+1}  (B, N, spatial_dim)"""
+        x = self.token_embed(s_t)                    # (B, N, hidden)
+        a = self.action_embed(action).unsqueeze(1)   # (B, 1, hidden)
+        x = torch.cat([a, x], dim=1)                 # (B, N+1, hidden)
+        x = self.blocks(x)                           # (B, N+1, hidden)
+        x = self.norm(x[:, 1:, :])                   # (B, N, hidden)
+        return self.out(x)                           # (B, N, spatial_dim)
+
+    def rollout(
+        self,
+        s0:      torch.Tensor,   # (B, N, spatial_dim)
+        actions: torch.Tensor,   # (B, T, 7)
+    ) -> torch.Tensor:
+        """Multi-step rollout → (B, T, N, spatial_dim)"""
+        B, T, _ = actions.shape
+        s = s0
+        out = []
+        for t in range(T):
+            s = self.forward(s, actions[:, t])
+            out.append(s)
+        return torch.stack(out, dim=1)

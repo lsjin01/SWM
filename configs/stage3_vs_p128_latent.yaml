@@ -1,0 +1,42 @@
+# Stage 3 — Latent Reward (대신 graph reward 사용하지 않음)
+#
+# Graph reward와의 차이:
+#   reward_type: latent   → -cos_sim(z_T_transition, z_goal_encoded)
+#   z_goal = encoder(마지막_데모_프레임)   ← 실제 goal 관측을 latent로 인코딩
+#   graph head 불필요 (오차 단계 제거)
+#
+# 나머지 hyperparams는 vs_p128과 동일 (fair comparison 유지)
+
+experiment:
+  name: swm_stage3_latent_square
+  seed: 42
+  output_dir: outputs/stage3/vs_p128_latent/square
+
+task: square
+unnorm_key: square_d0_300_demos
+
+reward_type: latent       # 'graph' or 'latent'
+reward_metric: cosine     # 'cosine' (bounded) or 'l2'
+
+vla_path: /NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO/checkpoint_files/SFT_models/square
+swm_ckpt: outputs/stage2/multitask_dinosiglip/best.pt
+stage1_ckpt: outputs/stage1/multitask_dinosiglip/best.pt
+
+data_root: /NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO-JEPA/data
+
+training:
+  iterations: 100
+  max_demos: 300
+  n_states_per_iter: 2
+  g_rollouts: 4
+  mini_g: 1
+  n_rollout_chunks: 8
+  temperature: 1.6
+  full_finetune: true
+  gradient_checkpointing: true
+  lr: 5.0e-6
+  clip_eps: 0.2
+  kl_coef: 0.0
+  grad_clip: 1.0
+  log_every: 1
+  save_every: 20

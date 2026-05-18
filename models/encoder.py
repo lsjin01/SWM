@@ -139,6 +139,7 @@ class SWMEncoder(nn.Module):
         vla_path: str,
         freeze_backbone: bool = True,
         latent_dim: int = 2176,
+        spatial_dim: int = 256,
     ):
         super().__init__()
         self.backbone = DINOSigLIPEncoder(
@@ -154,6 +155,11 @@ class SWMEncoder(nn.Module):
                 nn.LayerNorm(latent_dim),
             )
         self.latent_dim = latent_dim
+        self.spatial_proj = nn.Sequential(
+            nn.Linear(self.backbone.embed_dim, spatial_dim),
+            nn.LayerNorm(spatial_dim),
+        )
+        self.spatial_dim = spatial_dim
 
     def encode_spatial(self, image: torch.Tensor) -> torch.Tensor:
         """image (B,3,H,W) → spatial patch features (B, 256, latent_dim) [VLA projector용]"""
@@ -179,3 +185,8 @@ class SWMEncoder(nn.Module):
         w = w / w.sum().clamp(min=1e-8)
         z = (spatial * w.unsqueeze(0).unsqueeze(-1)).sum(dim=1)  # (B, 2176)
         return self.proj(z.float())
+
+    def encode_spatial_projected(self, image: torch.Tensor) -> torch.Tensor:
+        """image (B,3,H,W) → projected spatial tokens (B, 256, spatial_dim)"""
+        spatial = self.backbone.forward_spatial(image)   # (B, 256, 2176)
+        return self.spatial_proj(spatial.float())        # (B, 256, spatial_dim)

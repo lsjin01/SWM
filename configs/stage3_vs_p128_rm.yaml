@@ -1,0 +1,47 @@
+# Stage 3 — Learned Reward Model (Stage 2.5에서 학습된 goal-conditioned RM)
+#
+# reward_type: reward_model
+#   → SWMRewardModel(z_T, z_goal) ∈ [0, 1]
+#   → 명시적으로 성공/미완 프레임으로 학습된 binary classifier
+#   → graph head / cosine similarity보다 직접적인 task-success 신호
+#
+# 나머지는 vs_p128과 동일
+
+experiment:
+  name: swm_stage3_rm_square
+  seed: 42
+  output_dir: outputs/stage3/vs_p128_rm/square
+
+task: square
+unnorm_key: square_d0_300_demos
+
+reward_type: reward_model
+reward_model_ckpt: outputs/stage2_5/square/best.pt
+
+reward_model:
+  latent_dim: 2176
+  hidden_dim: 512
+  n_layers: 3
+
+vla_path: /NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO/checkpoint_files/SFT_models/square
+swm_ckpt: outputs/stage2/multitask_dinosiglip/best.pt
+stage1_ckpt: outputs/stage1/multitask_dinosiglip/best.pt
+
+data_root: /NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO-JEPA/data
+
+training:
+  iterations: 100
+  max_demos: 300
+  n_states_per_iter: 2
+  g_rollouts: 4
+  mini_g: 1
+  n_rollout_chunks: 8
+  temperature: 1.6
+  full_finetune: true
+  gradient_checkpointing: true
+  lr: 5.0e-6
+  clip_eps: 0.2
+  kl_coef: 0.0
+  grad_clip: 1.0
+  log_every: 1
+  save_every: 20

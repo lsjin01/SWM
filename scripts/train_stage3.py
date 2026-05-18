@@ -151,6 +151,7 @@ def swm_rollout(
         z_history      : list[Tensor(1, 2176)]  WM latent history
     """
     z = z0.clone().to(device, dtype)
+    is_spatial = (z.ndim == 3)  # (B, N, d_s) vs (B, D)
 
     # ── 초기 이미지 → spatial patch embeddings (한 번만 계산) ────────────
     with torch.no_grad():
@@ -176,9 +177,12 @@ def swm_rollout(
         actions = tokens_to_actions(tids)  # (1, 8, 7)
         with torch.no_grad():
             for sub in range(NUM_ACTIONS_CHUNK):
-                a = actions[0, sub].float().to(device)
-                z = transition(z.float(), a.unsqueeze(0)).to(dtype)
-                z_history.append(z.clone())
+                a = actions[0, sub].to(device, dtype)
+                z = transition(z.to(dtype), a.unsqueeze(0))
+                if is_spatial:
+                    z_history.append(z.mean(dim=1).clone())  # (B, d_s) for reward
+                else:
+                    z_history.append(z.clone())
 
     return token_ids_list, logprobs_list, patch_embeds_cpu, z_history
 
@@ -334,9 +338,10 @@ def latent_reward(z_history, z_goal, device, metric='cosine', z_init=None, pca=N
         return -(z_final - z_g).norm(dim=-1).mean().item()
 
 
-def fit_demo_pca(demo_dir, task, encoder, max_demos, device, dtype, n_components=16, stride=2):
+def fit_demo_pca(demo_dir, task, encoder, max_demos, device, dtype, n_components=16, stride=2, token_weights=None):
     """
     demo 전체 프레임을 인코딩해 PCA fit → task-relevant subspace 추출.
+    token_weights 제공 시 encode_weighted 사용 (spatial pooling과 동일 분포).
     반환: sklearn PCA object (CPU-side, numpy 기반)
     """
     import h5py
@@ -357,7 +362,12 @@ def fit_demo_pca(demo_dir, task, encoder, max_demos, device, dtype, n_components
             imgs = f[f'data/{dn}/obs/agentview_image']
             for i in range(0, len(imgs), stride):
                 t = transform(np.array(imgs[i])).unsqueeze(0).to(device)
-                z = encoder(t).float().cpu().squeeze(0).numpy()
+                if hasattr(encoder, 'spatial_proj') and getattr(encoder, 'spatial_dim', None) is not None and token_weights is None:
+                    z = encoder.encode_spatial_projected(t).mean(dim=1).float().cpu().squeeze(0).numpy()
+                elif token_weights is not None:
+                    z = encoder.encode_weighted(t, token_weights).float().cpu().squeeze(0).numpy()
+                else:
+                    z = encoder(t).float().cpu().squeeze(0).numpy()
                 all_z.append(z)
     all_z = np.stack(all_z)   # (N, 2176)
     pca = SklearnPCA(n_components=n_components)
@@ -510,7 +520,8 @@ def reward_model_reward(z_history, z_goal, reward_model, device):
 @torch.no_grad()
 def load_initial_states(demo_dir, task, encoder, max_demos, device, dtype,
                         reward_type='graph', transition=None, rollout_steps=64,
-                        n_goals=1, token_weights=None):
+                        n_goals=1, token_weights=None, pca=None,
+                        pca_goal_threshold=0.2):
     """
     데모 첫 프레임을 인코딩.
 
@@ -547,7 +558,12 @@ def load_initial_states(demo_dir, task, encoder, max_demos, device, dtype,
             img_np    = f[f'data/{dn}/obs/agentview_image'][0]
             image_t   = transform(img_np).unsqueeze(0)
             image_gpu = image_t.to(device)
-            z = encoder(image_gpu).to(dtype)
+            if hasattr(encoder, 'spatial_proj') and getattr(encoder, 'spatial_dim', None) is not None and token_weights is None:
+                z = encoder.encode_spatial_projected(image_gpu).to(dtype)  # (1, 256, d_s)
+            elif token_weights is not None:
+                z = encoder.encode_weighted(image_gpu, token_weights).to(dtype)
+            else:
+                z = encoder(image_gpu).to(dtype)
 
             init_images.append(image_t.cpu())
             init_latents.append(z.cpu())
@@ -558,14 +574,53 @@ def load_initial_states(demo_dir, task, encoder, max_demos, device, dtype,
                 n_steps = min(rollout_steps, len(demo_actions))
                 z_t = z.clone()
                 for t in range(n_steps):
-                    a = torch.from_numpy(demo_actions[t]).float().to(device).unsqueeze(0)
-                    z_t = transition(z_t.float(), a).to(dtype)
+                    a = torch.from_numpy(demo_actions[t]).to(device, dtype).unsqueeze(0)
+                    z_t = transition(z_t.to(dtype), a)
                 init_goals.append(z_t.cpu())
 
             elif reward_type in ('latent', 'reward_model'):
                 imgs = f[f'data/{dn}/obs/agentview_image']
                 T_demo = len(imgs)
-                if n_goals == 1:
+                if n_goals == 'pca_adaptive':
+                    assert pca is not None, "n_goals='pca_adaptive' requires fitted PCA"
+                    # ── PCA 공간에서 데모 trajectory 투영 ─────────────────────────
+                    local_stride = max(1, T_demo // 200)
+                    frame_indices = list(range(0, T_demo, local_stride))
+                    if frame_indices[-1] != T_demo - 1:
+                        frame_indices.append(T_demo - 1)
+
+                    def _encode_np(idx):
+                        img_t = transform(np.array(imgs[idx])).unsqueeze(0).to(device)
+                        if hasattr(encoder, 'spatial_proj') and getattr(encoder, 'spatial_dim', None) is not None and token_weights is None:
+                            return encoder.encode_spatial_projected(img_t).mean(dim=1).float().cpu().numpy().flatten()
+                        elif token_weights is not None:
+                            return encoder.encode_weighted(img_t, token_weights).float().cpu().numpy().flatten()
+                        else:
+                            return encoder(img_t).float().cpu().numpy().flatten()
+
+                    pca_vecs = np.stack([pca.transform(_encode_np(i).reshape(1, -1))[0]
+                                         for i in frame_indices])  # (T', n_pca)
+
+                    # ── start→end 방향으로 normalized scalar projection 계산 ──────
+                    p0, pT = pca_vecs[0], pca_vecs[-1]
+                    direction = pT - p0
+                    total_sq  = float(np.dot(direction, direction)) + 1e-8
+                    projections = [float(np.dot(pv - p0, direction) / total_sq)
+                                   for pv in pca_vecs]
+
+                    # ── threshold 초과 시마다 goal frame 선택 ────────────────────
+                    goal_frame_indices = []
+                    last_proj = 0.0
+                    for fi, proj in zip(frame_indices, projections):
+                        if proj - last_proj >= pca_goal_threshold:
+                            goal_frame_indices.append(fi)
+                            last_proj = proj
+                    if not goal_frame_indices or goal_frame_indices[-1] != T_demo - 1:
+                        goal_frame_indices.append(T_demo - 1)
+
+                    indices = goal_frame_indices
+
+                elif n_goals == 1:
                     indices = [T_demo - 1]
                 elif n_goals == 'action':
                     # action velocity 기반 phase 감지:
@@ -595,12 +650,20 @@ def load_initial_states(demo_dir, task, encoder, max_demos, device, dtype,
                 goal_latents = []
                 for idx in indices:
                     goal_t = transform(imgs[idx]).unsqueeze(0).to(device)
-                    if token_weights is not None:
+                    if hasattr(encoder, 'spatial_proj') and getattr(encoder, 'spatial_dim', None) is not None and token_weights is None:
+                        goal_latents.append(encoder.encode_spatial_projected(goal_t).to(dtype).mean(dim=1).cpu())
+                    elif token_weights is not None:
                         goal_latents.append(encoder.encode_weighted(goal_t, token_weights).to(dtype).cpu())
                     else:
                         goal_latents.append(encoder(goal_t).to(dtype).cpu())
-                # single goal → Tensor, multi-goal → list[Tensor]
-                init_goals.append(goal_latents[0] if n_goals == 1 else goal_latents)
+                # single goal → Tensor, multi-goal or pca_adaptive → list[Tensor]
+                if n_goals == 1:
+                    init_goals.append(goal_latents[0])
+                else:
+                    if n_goals == 'pca_adaptive' and is_main():
+                        log.info(f"  [{dn}] pca_adaptive: {len(goal_latents)} goals "
+                                 f"(threshold={pca_goal_threshold:.2f})")
+                    init_goals.append(goal_latents)
 
             else:  # 'graph'
                 obj = f[f'data/{dn}/obs/object'][-1]
@@ -677,21 +740,44 @@ def main():
     s1_ckpt = torch.load(cfg.stage1_ckpt, map_location=device)
     s1_cfg  = OmegaConf.create(s1_ckpt.get('cfg', {}))
 
+    use_spatial_swm = 'spatial_proj' in s2_ckpt and 'spatial_dim' in s2_ckpt
+    spatial_dim_swm = s2_ckpt.get('spatial_dim', 256) if use_spatial_swm else None
+
+    spatial_dim_for_enc = spatial_dim_swm if use_spatial_swm else 256
     encoder = SWMEncoder(
         vla_path=cfg.vla_path,
         freeze_backbone=True,
         latent_dim=2176,
+        spatial_dim=spatial_dim_for_enc,
     ).to(device)
-    encoder.load_state_dict(s1_ckpt['encoder'])
+    # spatial_proj는 stage1 ckpt에 없음 → strict=False
+    encoder.load_state_dict(s1_ckpt['encoder'], strict=False)
 
-    transition = SWMTransition(
-        latent_dim=2176,
-        action_dim=7,
-        hidden_dim=s2_cfg.get('transition', {}).get('hidden_dim', 512),
-        num_layers=s2_cfg.get('transition', {}).get('num_layers', 6),
-        num_heads =s2_cfg.get('transition', {}).get('num_heads',  8),
-    ).to(device)
-    transition.load_state_dict(s2_ckpt['transition'])
+    if use_spatial_swm:
+        from models.transition import SpatialSWMTransition
+        transition = SpatialSWMTransition(
+            spatial_dim=spatial_dim_swm,
+            action_dim=7,
+        ).to(device).to(dtype)
+        transition.load_state_dict(s2_ckpt['transition'])
+        encoder.spatial_proj = nn.Sequential(
+            nn.Linear(2176, spatial_dim_swm),
+            nn.LayerNorm(spatial_dim_swm),
+        ).to(device)
+        encoder.spatial_proj.load_state_dict(s2_ckpt['spatial_proj'])
+        encoder.spatial_dim = spatial_dim_swm
+        for p in encoder.spatial_proj.parameters():
+            p.requires_grad = False
+        encoder.spatial_proj.eval()
+    else:
+        transition = SWMTransition(
+            latent_dim=2176,
+            action_dim=7,
+            hidden_dim=s2_cfg.get('transition', {}).get('hidden_dim', 512),
+            num_layers=s2_cfg.get('transition', {}).get('num_layers', 6),
+            num_heads =s2_cfg.get('transition', {}).get('num_heads',  8),
+        ).to(device)
+        transition.load_state_dict(s2_ckpt['transition'])
 
     heads = SWMHeads(
         latent_dim=2176,
@@ -797,18 +883,8 @@ def main():
     spatial_pooling = cfg.get('spatial_pooling', 'mean')
     spatial_top_k   = cfg.get('spatial_top_k', 64)
 
-    # ── PCA fit (pca_cosine / pca_delta_cosine) ──────────────────────────────
-    demo_pca = None
-    if reward_metric in ('pca_cosine', 'pca_delta_cosine'):
-        n_pca = cfg.get('pca_components', 16)
-        if is_main():
-            log.info(f"Fitting demo PCA (n_components={n_pca}) ...")
-        demo_pca = fit_demo_pca(
-            cfg.data_root, task, encoder, cfg.training.max_demos,
-            device, dtype, n_components=n_pca
-        )
-
     # ── Spatial token weights (variance / correlation / activation) ───────────
+    # PCA보다 먼저 계산: PCA fitting 시 동일 인코딩 방식 사용 위함
     token_weights = None
     if spatial_pooling in ('variance', 'correlation', 'activation', 'slot_attention'):
         if is_main():
@@ -816,6 +892,18 @@ def main():
         token_weights = compute_spatial_weights(
             cfg.data_root, task, encoder, cfg.training.max_demos,
             device, dtype, method=spatial_pooling, top_k=spatial_top_k,
+        )
+
+    # ── PCA fit (pca_cosine / pca_delta_cosine) ──────────────────────────────
+    # token_weights 전달 → spatial pooling 시 encode_weighted로 PCA 학습 (분포 일치)
+    demo_pca = None
+    if reward_metric in ('pca_cosine', 'pca_delta_cosine') or n_goals == 'pca_adaptive':
+        n_pca = cfg.get('pca_components', 16)
+        if is_main():
+            log.info(f"Fitting demo PCA (n_components={n_pca}) ...")
+        demo_pca = fit_demo_pca(
+            cfg.data_root, task, encoder, cfg.training.max_demos,
+            device, dtype, n_components=n_pca, token_weights=token_weights,
         )
 
     if is_main():
@@ -830,6 +918,8 @@ def main():
         rollout_steps=rollout_steps,
         n_goals=n_goals,
         token_weights=token_weights,
+        pca=demo_pca,
+        pca_goal_threshold=cfg.get('pca_goal_threshold', 0.2),
     )
 
     # ── Reward model 로딩 (reward_type='reward_model'일 때만) ─────────────────
@@ -923,9 +1013,10 @@ def main():
                         actual_metric = 'delta_cosine'
                     else:
                         actual_metric = reward_metric
+                    z_init_1d = z0.mean(dim=1).cpu() if z0.ndim == 3 else z0.cpu()
                     rew = latent_reward(z_hist, goal, device,
                                         metric=actual_metric,
-                                        z_init=z0.cpu(),
+                                        z_init=z_init_1d,
                                         pca=use_pca,
                                         phase_threshold=phase_threshold,
                                         aggregation=reward_aggregation)

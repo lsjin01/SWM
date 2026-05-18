@@ -1,0 +1,44 @@
+# Stage 3 — Transition-L2 Reward + LoRA + KL penalty
+#
+# full_finetune=False 이전 실험들의 문제:
+#   full_finetune=True + noisy reward → SFT policy 전체 덮어씌워 0% SR
+#
+# 이번 변경:
+#   full_finetune: false   → projector + q/v_proj만 학습 (~400M params)
+#                            LLM backbone 대부분 보존 → SFT 행동 유지
+#   kl_coef: 0.05         → rollout policy 대비 KL penalty로 급격한 분포 변화 방지
+#   reward_type: transition_l2  → 지금까지 유일하게 variance 있었던 reward
+#   gradient_checkpointing: false  → LoRA면 메모리 여유 충분
+
+experiment:
+  name: swm_stage3_tl2_lora_square
+  seed: 42
+  output_dir: outputs/stage3/vs_p128_tl2_lora/square
+
+task: square
+unnorm_key: square_d0_300_demos
+
+reward_type: transition_l2
+
+vla_path: /NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO/checkpoint_files/SFT_models/square
+swm_ckpt: outputs/stage2/multitask_dinosiglip/best.pt
+stage1_ckpt: outputs/stage1/multitask_dinosiglip/best.pt
+
+data_root: /NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO-JEPA/data
+
+training:
+  iterations: 100
+  max_demos: 300
+  n_states_per_iter: 2
+  g_rollouts: 4
+  mini_g: 1
+  n_rollout_chunks: 8
+  temperature: 1.6
+  full_finetune: false          # projector + q/v_proj only
+  gradient_checkpointing: false # LoRA면 메모리 여유
+  lr: 5.0e-6
+  clip_eps: 0.2
+  kl_coef: 0.05                 # SFT policy 파괴 방지
+  grad_clip: 1.0
+  log_every: 1
+  save_every: 20

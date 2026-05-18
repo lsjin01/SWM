@@ -1,0 +1,52 @@
+# Stage 3 — SWMRewardModel Reward + LoRA + KL penalty
+#
+# transition_l2 실패 원인:
+#   - WM latent L2 거리가 task success와 상관관계 낮음
+#   - 4개 rollout으로 advantage variance가 너무 작음 (-14~-17 범위)
+#
+# 이번 변경:
+#   reward_type: reward_model  → Stage 2.5에서 학습된 goal-conditioned 이진 분류기
+#                                출력이 [0,1]로 bounded → advantage 추정 더 안정적
+#   g_rollouts: 8             → 그룹당 8개로 늘려 advantage variance 개선
+#   n_states_per_iter: 4      → 더 다양한 시작 상태로 일반화
+#   iterations: 200           → 더 길게 학습
+#   temperature: 1.2          → 적당한 exploration (1.6은 너무 noisy했음)
+
+experiment:
+  name: swm_stage3_rm_lora_square
+  seed: 42
+  output_dir: outputs/stage3/vs_p128_rm_lora/square
+
+task: square
+unnorm_key: square_d0_300_demos
+
+reward_type: reward_model
+reward_model_ckpt: outputs/stage2_5_v2/square/best.pt
+
+reward_model:
+  latent_dim: 2176
+  hidden_dim: 512
+  n_layers: 3
+
+vla_path: /NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO/checkpoint_files/SFT_models/square
+swm_ckpt: outputs/stage2/multitask_dinosiglip/best.pt
+stage1_ckpt: outputs/stage1/multitask_dinosiglip/best.pt
+
+data_root: /NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO-JEPA/data
+
+training:
+  iterations: 200
+  max_demos: 300
+  n_states_per_iter: 4
+  g_rollouts: 8
+  mini_g: 2
+  n_rollout_chunks: 20
+  temperature: 1.2
+  full_finetune: false          # projector + q/v_proj only
+  gradient_checkpointing: false
+  lr: 5.0e-6
+  clip_eps: 0.2
+  kl_coef: 0.05
+  grad_clip: 1.0
+  log_every: 1
+  save_every: 20

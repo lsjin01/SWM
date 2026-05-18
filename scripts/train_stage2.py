@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from models.encoder import SWMEncoder
 from models.heads import SWMHeads
-from models.transition import SWMTransition
+from models.transition import SWMTransition, SpatialSWMTransition
 from data.dataset import Stage2Dataset, MultiTaskStage2Dataset
 
 log = logging.getLogger(__name__)
@@ -73,15 +73,17 @@ def load_frozen_stage1(ckpt_path: str, cfg, device):
     dropout     = s1_cfg.get("heads", {}).get("graph_head", {}).get("dropout", 0.1)
     vla_path    = s1_cfg.get("encoder", {}).get("vla_path", None)
 
+    spatial_dim = cfg.encoder.get("spatial_dim", 256)
     # DINOv2+SigLIP or V-JEPA-2
     if vla_path:
         encoder = SWMEncoder(
             vla_path=vla_path,
             freeze_backbone=True,
             latent_dim=latent_dim,
+            spatial_dim=spatial_dim,
         ).to(device)
     else:
-        encoder = SWMEncoder(latent_dim=latent_dim).to(device)
+        encoder = SWMEncoder(latent_dim=latent_dim, spatial_dim=spatial_dim).to(device)
 
     heads = SWMHeads(
         latent_dim=latent_dim,
@@ -91,7 +93,8 @@ def load_frozen_stage1(ckpt_path: str, cfg, device):
         dropout=dropout,
     ).to(device)
 
-    encoder.load_state_dict(sd["encoder"])
+    # spatial_proj는 새로 추가된 파라미터라 stage1 ckpt에 없음 → strict=False
+    encoder.load_state_dict(sd["encoder"], strict=False)
     heads.load_state_dict(sd["heads"])
 
     for p in encoder.parameters(): p.requires_grad = False
@@ -213,6 +216,75 @@ def evaluate(transition, encoder, heads, loader, cfg, device):
 
     n = len(loader)
     return total/n, gl_t/n, jl_t/n
+
+
+def train_one_epoch_spatial(transition, encoder, loader, optimizer, scaler, cfg, device, epoch):
+    transition.train()
+    encoder.spatial_proj.train()
+
+    lw_j     = cfg.loss.lambda_jepa
+    jepa_fn  = nn.L1Loss() if cfg.loss.jepa_loss == "l1" else nn.MSELoss()
+    total    = 0.0
+
+    for step, batch in enumerate(loader):
+        image_t  = batch["image_t"].to(device)
+        image_t1 = batch["image_t1"].to(device)
+        action   = batch["action"].to(device)
+
+        with torch.no_grad():
+            # backbone is frozen; spatial_proj is trainable but computed inside autocast
+            pass
+
+        with torch.amp.autocast("cuda", enabled=cfg.training.amp):
+            s_t  = encoder.encode_spatial_projected(image_t)   # (B, 256, d_s)
+            s_gt = encoder.encode_spatial_projected(image_t1)  # (B, 256, d_s)
+
+            s_in = s_t
+            if cfg.training.noise_injection.enabled:
+                s_in = s_t + torch.randn_like(s_t) * cfg.training.noise_injection.std
+
+            s_hat = transition(s_in, action)
+            loss  = lw_j * jepa_fn(s_hat, s_gt.detach())
+
+        optimizer.zero_grad()
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        raw_trans = transition.module if hasattr(transition, "module") else transition
+        nn.utils.clip_grad_norm_(
+            list(raw_trans.parameters()) + list(encoder.spatial_proj.parameters()),
+            cfg.training.grad_clip,
+        )
+        scaler.step(optimizer)
+        scaler.update()
+
+        total += loss.item()
+
+        if is_main() and step % cfg.training.log_interval == 0:
+            log.info(
+                f"Epoch {epoch:03d}  Step {step:04d}/{len(loader)}"
+                f"  loss={loss.item():.4f}"
+            )
+
+    return total / max(len(loader), 1)
+
+
+def evaluate_spatial(transition, encoder, loader, cfg, device):
+    transition.eval()
+    encoder.spatial_proj.eval()
+    jepa_fn = nn.L1Loss() if cfg.loss.jepa_loss == "l1" else nn.MSELoss()
+    total   = 0.0
+    with torch.no_grad():
+        for batch in loader:
+            image_t  = batch["image_t"].to(device)
+            image_t1 = batch["image_t1"].to(device)
+            action   = batch["action"].to(device)
+            with torch.amp.autocast("cuda", enabled=cfg.training.amp):
+                s_t   = encoder.encode_spatial_projected(image_t)
+                s_gt  = encoder.encode_spatial_projected(image_t1)
+                s_hat = transition(s_t, action)
+                loss  = jepa_fn(s_hat, s_gt.detach())
+            total += loss.item()
+    return total / max(len(loader), 1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -348,12 +420,27 @@ def main():
         log.info(f"Train pairs: {len(train_ds)}  Val pairs: {len(val_ds)}")
 
     # ── Transition ────────────────────────────────────────────────────────────
-    transition = SWMTransition(
-        latent_dim=cfg.encoder.latent_dim,
-        action_dim=cfg.transition.action_dim,
-        noise_std=cfg.training.noise_injection.std
-                  if cfg.training.noise_injection.enabled else 0.0,
-    ).to(device)
+    use_spatial = cfg.transition.get("use_spatial", False)
+    if use_spatial:
+        spatial_dim = cfg.transition.get("spatial_dim", 256)
+        transition = SpatialSWMTransition(
+            spatial_dim=spatial_dim,
+            action_dim=cfg.transition.action_dim,
+            hidden_dim=cfg.transition.hidden_dim,
+            num_layers=cfg.transition.num_layers,
+            num_heads=cfg.transition.num_heads,
+            dropout=cfg.transition.dropout,
+        ).to(device)
+        encoder.spatial_proj.to(device)
+        for p in encoder.spatial_proj.parameters():
+            p.requires_grad = True
+    else:
+        transition = SWMTransition(
+            latent_dim=cfg.encoder.latent_dim,
+            action_dim=cfg.transition.action_dim,
+            noise_std=cfg.training.noise_injection.std
+                      if cfg.training.noise_injection.enabled else 0.0,
+        ).to(device)
 
     if use_ddp:
         transition = DDP(transition, device_ids=[local_rank])
@@ -363,8 +450,13 @@ def main():
         n = sum(p.numel() for p in raw_trans.parameters())
         log.info(f"Transition params: {n:,}")
 
+    if use_spatial:
+        opt_params = list((transition.module if use_ddp else transition).parameters()) + \
+                     list(encoder.spatial_proj.parameters())
+    else:
+        opt_params = list((transition.module if use_ddp else transition).parameters())
     optimizer = torch.optim.AdamW(
-        (transition.module if use_ddp else transition).parameters(),
+        opt_params,
         lr=cfg.training.lr,
         weight_decay=cfg.training.weight_decay,
     )
@@ -392,11 +484,19 @@ def main():
         if use_ddp:
             train_sampler.set_epoch(epoch)
 
-        tr = train_one_epoch(
-            transition, encoder, heads,
-            train_loader, optimizer, scaler, cfg, device, epoch
-        )
-        vl = evaluate(transition, encoder, heads, val_loader, cfg, device)
+        if use_spatial:
+            tr_loss = train_one_epoch_spatial(
+                transition, encoder, train_loader, optimizer, scaler, cfg, device, epoch
+            )
+            vl_loss = evaluate_spatial(transition, encoder, val_loader, cfg, device)
+            tr = (tr_loss, 0.0, tr_loss)
+            vl = (vl_loss, 0.0, vl_loss)
+        else:
+            tr = train_one_epoch(
+                transition, encoder, heads,
+                train_loader, optimizer, scaler, cfg, device, epoch
+            )
+            vl = evaluate(transition, encoder, heads, val_loader, cfg, device)
         scheduler.step()
 
         if is_main():
@@ -421,6 +521,9 @@ def main():
                 "val_loss":   vl[0],
                 "cfg":        OmegaConf.to_container(cfg),
             }
+            if use_spatial:
+                ckpt["spatial_proj"] = encoder.spatial_proj.state_dict()
+                ckpt["spatial_dim"]  = cfg.transition.get("spatial_dim", 256)
 
             if epoch % cfg.training.save_interval == 0:
                 torch.save(ckpt, out_dir / f"ckpt_epoch{epoch:03d}.pt")

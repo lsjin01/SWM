@@ -1,0 +1,40 @@
+# Debug: 2 iter, 5 demos
+experiment:
+  name: swm_stage3_spatial_pca_multi_goal_debug
+  seed: 42
+  output_dir: outputs/stage3/spatial_pca_multi_goal_debug/square
+
+task: square
+unnorm_key: square_d0_300_demos
+
+reward_type: latent
+reward_metric: pca_cosine
+pca_components: 16
+n_goals: pca_adaptive
+pca_goal_threshold: 0.3
+phase_threshold: 0.3
+reward_aggregation: mean
+
+vla_path: /NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO/checkpoint_files/SFT_models/square
+swm_ckpt: outputs/stage2/spatial_multitask/best.pt
+stage1_ckpt: outputs/stage1/multitask_dinosiglip/best.pt
+
+data_root: /NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO-JEPA/data
+
+training:
+  iterations: 2
+  max_demos: 5
+  n_states_per_iter: 1
+  g_rollouts: 2
+  mini_g: 0
+  n_rollout_chunks: 1
+  temperature: 1.2
+  full_finetune: false
+  freeze_projector: true
+  gradient_checkpointing: false
+  lr: 5.0e-6
+  clip_eps: 0.2
+  kl_coef: 0.05
+  grad_clip: 1.0
+  log_every: 1
+  save_every: 2
