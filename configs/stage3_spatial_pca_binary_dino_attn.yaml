@@ -1,10 +1,8 @@
-# Direction 1: PCA binary phase reward (Spatial SWM)
-# 각 goal의 progress > threshold → 1, else 0  →  {0, 0.25, 0.5, 0.75, 1.0}
-# within-group reward variance 극대화
+# Spatial SWM: pca_binary + patch_weight=dino_attn
 experiment:
-  name: swm_stage3_spatial_pca_binary_delta_square
+  name: swm_stage3_spatial_pca_binary_dino_attn_square
   seed: 42
-  output_dir: outputs/stage3/spatial_pca_binary_delta/square
+  output_dir: outputs/stage3/spatial_pca_binary_dino_attn/square
 
 task: square
 unnorm_key: square_d0_300_demos
@@ -13,8 +11,8 @@ reward_type: latent
 reward_metric: pca_cosine
 pca_components: 16
 n_goals: 4
-phase_threshold: 0.6       # progress_k > 0.6 → 1.0, else 0.0
-reward_aggregation: mean   # mean of binary per-goal rewards
+phase_threshold: 0.6
+reward_aggregation: mean
 
 vla_path: /NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO/checkpoint_files/SFT_models/square
 swm_ckpt: outputs/stage2/spatial_multitask/best.pt
@@ -39,5 +37,5 @@ training:
   grad_clip: 1.0
   log_every: 1
   save_every: 20
-patch_weight_method: delta
+patch_weight_method: dino_attn
 patch_weight_top_k: 64

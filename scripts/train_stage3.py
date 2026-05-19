@@ -345,14 +345,41 @@ def latent_reward(z_history, z_goal, device, metric='cosine', z_init=None, pca=N
 
 
 @torch.no_grad()
+def _get_dino_cls_attn(dino, dino_img):
+    """
+    DINOv2 마지막 block의 CLS→patch attention 추출.
+    Returns: (B, 256) float CPU tensor
+    """
+    captured = {}
+
+    def _hook(module, inp, out):
+        x = inp[0]                                        # (B, N, C)
+        B, N, C = x.shape
+        head_dim = C // module.num_heads
+        qkv = module.qkv(x).reshape(B, N, 3, module.num_heads, head_dim).permute(2, 0, 3, 1, 4)
+        q, k, _ = qkv.unbind(0)                          # (B, heads, N, head_dim)
+        attn = (q @ k.transpose(-2, -1)) * module.scale  # (B, heads, N, N)
+        attn = attn.softmax(dim=-1)
+        # patch tokens are the last 256 (after CLS + any register tokens)
+        captured['attn'] = attn[:, :, 0, -256:].mean(1).float().cpu()  # (B, 256)
+
+    handle = dino.blocks[-1].attn.register_forward_hook(_hook)
+    with torch.no_grad():
+        dino.forward_features(dino_img)
+    handle.remove()
+    return captured['attn']
+
+
 def compute_spatial_patch_weights(
     demo_dir, task, encoder, transition, max_demos, device, dtype,
     method='attn', top_k=64, stride=4,
 ):
     """
     Demo transitions에서 spatial patch weights 계산.
-    method='attn'  : SpatialSWMTransition 마지막 layer action→patch attention
-    method='delta' : Δs = ||s_{t+1} - s_t||₂ per patch
+    method='attn'       : SpatialSWMTransition 마지막 layer action→patch attention
+    method='delta'      : Δs = ||s_{t+1} - s_t||₂ per patch
+    method='dino_attn'  : DINOv2 CLS→patch attention (마지막 block, 학습 불필요)
+    method='pca_variance': 패치별 feature variance across demos (고변동 = task-relevant)
     Returns: (256,) normalized weight tensor (CPU)
     """
     import h5py
@@ -366,9 +393,77 @@ def compute_spatial_patch_weights(
         transforms.ToPILImage(), transforms.Resize((224, 224)), transforms.ToTensor(),
     ])
 
+    # pca_variance: Welford online variance per patch position
+    if method == 'pca_variance':
+        n_patches = 256
+        sum_s  = torch.zeros(n_patches)          # sum of ||s_t^i||^2 (scalar per patch)
+        sum_sq = torch.zeros(n_patches)          # sum of ||s_t^i||^2
+        count  = 0
+        with h5py.File(hdf5, 'r') as f:
+            demos = sorted(f['data'].keys())[:max_demos]
+            for dn in demos:
+                imgs = f[f'data/{dn}/obs/agentview_image']
+                T = len(imgs)
+                for t in range(0, T, stride):
+                    img_t = transform(np.array(imgs[t])).unsqueeze(0).to(device)
+                    with torch.no_grad():
+                        s_t = encoder.encode_spatial_projected(img_t).float().cpu()  # (1, 256, d_s)
+                    s = s_t.squeeze(0)                          # (256, d_s)
+                    norms_sq = (s * s).sum(-1)                  # (256,) ||s^i||^2
+                    norms    = norms_sq.sqrt()                  # (256,)
+                    sum_s  += norms
+                    sum_sq += norms_sq
+                    count  += 1
+        # Var[||s^i||] ≈ E[||s^i||^2] - E[||s^i||]^2
+        mean_sq = sum_sq / max(count, 1)
+        mean    = sum_s  / max(count, 1)
+        var     = (mean_sq - mean ** 2).clamp(min=0)          # (256,)
+        # top-k hard mask
+        if top_k < 256:
+            mask = torch.zeros(256)
+            mask[var.topk(top_k).indices] = 1.0
+            var = var * mask
+        weights = var / var.sum().clamp(min=1e-8)
+        if is_main():
+            nonzero = int((weights > 0).sum())
+            log.info(f"[patch_weights/pca_variance] demos={len(demos)}  steps={count}  "
+                     f"nonzero={nonzero}/256  top_k={top_k}")
+        return weights
+
+    # dino_attn: DINOv2 CLS attention (no transition needed)
+    if method == 'dino_attn':
+        dino = encoder.backbone.dino
+        weights_acc = torch.zeros(256)
+        count = 0
+        with h5py.File(hdf5, 'r') as f:
+            demos = sorted(f['data'].keys())[:max_demos]
+            for dn in demos:
+                imgs = f[f'data/{dn}/obs/agentview_image']
+                T = len(imgs)
+                for t in range(0, T, stride):
+                    img_t = transform(np.array(imgs[t])).unsqueeze(0).to(device)
+                    # DINO normalization
+                    m = torch.tensor([0.485, 0.456, 0.406], device=device, dtype=dtype).view(1,3,1,1)
+                    s = torch.tensor([0.229, 0.224, 0.225], device=device, dtype=dtype).view(1,3,1,1)
+                    dino_img = (img_t.to(dtype) - m) / s
+                    w = _get_dino_cls_attn(dino, dino_img).squeeze(0)  # (256,)
+                    weights_acc += w
+                    count += 1
+        weights = weights_acc / max(count, 1)
+        if top_k < 256:
+            mask = torch.zeros(256)
+            mask[weights.topk(top_k).indices] = 1.0
+            weights = weights * mask
+        weights = weights / weights.sum().clamp(min=1e-8)
+        if is_main():
+            nonzero = int((weights > 0).sum())
+            log.info(f"[patch_weights/dino_attn] demos={len(demos)}  steps={count}  "
+                     f"nonzero={nonzero}/256  top_k={top_k}")
+        return weights
+
+    # attn / delta (original methods)
     weights_acc = torch.zeros(256)
     count = 0
-
     with h5py.File(hdf5, 'r') as f:
         demos = sorted(f['data'].keys())[:max_demos]
         for dn in demos:
@@ -377,8 +472,8 @@ def compute_spatial_patch_weights(
             T = len(imgs)
             for t in range(0, T - 1, stride):
                 img_t = transform(np.array(imgs[t])).unsqueeze(0).to(device)
-                s_t   = encoder.encode_spatial_projected(img_t).to(dtype)   # (1, 256, d_s)
-                a_t   = torch.from_numpy(actions[t]).to(device, dtype).unsqueeze(0)  # (1, 7)
+                s_t   = encoder.encode_spatial_projected(img_t).to(dtype)
+                a_t   = torch.from_numpy(actions[t]).to(device, dtype).unsqueeze(0)
                 if method == 'attn':
                     w = transition.get_patch_weights(s_t, a_t, top_k=top_k)
                 else:
@@ -959,7 +1054,7 @@ def main():
     # ── Spatial patch weights (attn / delta) — Phase 2 전용 ──────────────────
     patch_weights = None
     patch_weight_method = cfg.get('patch_weight_method', None)
-    if patch_weight_method in ('attn', 'delta') and use_spatial_swm:
+    if patch_weight_method in ('attn', 'delta', 'dino_attn', 'pca_variance') and use_spatial_swm:
         spatial_top_k_pw = cfg.get('patch_weight_top_k', 64)
         if is_main():
             log.info(f"Computing spatial patch weights (method={patch_weight_method}, "

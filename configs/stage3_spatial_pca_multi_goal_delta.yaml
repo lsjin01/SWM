@@ -14,7 +14,7 @@ reward_metric: pca_cosine
 pca_components: 16
 n_goals: pca_adaptive         # PCA progress 기반 동적 goal 생성
 pca_goal_threshold: 0.3       # progress가 0.3 이상 올라갈 때마다 goal 생성 (~3-4개)
-phase_threshold: 0.3          # per-goal binary: progress > 0.3 → 1.0
+phase_threshold: 0.6          # per-goal binary: progress > 0.6 → 1.0
 reward_aggregation: mean
 
 vla_path: /NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO/checkpoint_files/SFT_models/square

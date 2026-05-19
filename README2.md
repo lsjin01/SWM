@@ -1,8 +1,7 @@
 # SWM Phase 2 — Spatial World Model for GRPO Reward Shaping
 
-> **Status**: Chain A (GPU 2,3,4) + Chain B (GPU 5,6,7) running in parallel
-
-→ Phase 1 결과 및 한계: [README.md](README.md)
+> **Status**: Chain 9–12 running (dino_attn + pca_variance) | Chain 1–8 COMPLETED
+> → Phase 1 results and baseline: [README.md](README.md)
 
 ---
 
@@ -12,9 +11,12 @@ Phase 1의 핵심 실패 원인은 **mean-pool scalar latent의 구조적 정보
 
 Phase 2의 핵심 주장:
 
-1. **Spatial representation 유지** — world model을 scalar space가 아닌 patch space (256×256)에서 학습하면, 배경 patch의 transition 분산이 작고 object patch의 transition 분산이 크다 → mean-pool 후에도 object 신호가 지배적
-2. **Semantic goal 생성** — 고정 temporal goal (25/50/75/100%) 대신 PCA progress threshold 기반 adaptive goal → demo마다 의미론적으로 의미 있는 phase 전환점에 reward 부여
-3. **Patch-selective reward** — attention map 또는 Δs magnitude로 task-relevant top-K patch를 식별하여 weighted mean-pool → 배경 noise 최소화
+1. **Spatial representation 유지** — world model을 scalar space가 아닌 patch space (256×256)에서 학습하면 object patch의 transition이 배경 patch를 지배
+2. **Semantic goal 생성** — 고정 temporal goal 대신 PCA progress threshold 기반 adaptive goal
+3. **Patch-selective reward** — task-relevant top-K patch를 식별하여 weighted mean-pool
+
+**Phase 2 실험 결과 요약 (2026-05-19 기준):**
+Phase 2 spatial SWM은 Phase 1 scalar SWM (26% SR)을 넘지 못했다 (최고 22%). 이는 spatial representation이 reward signal 품질을 개선하지 못함을 시사하며, 그 원인을 reward variance 분석 및 patch weight concentration 분석을 통해 규명하였다.
 
 ---
 
@@ -43,27 +45,24 @@ image_t ──→ encoder ──→ spatial_proj ──→ S_t ∈ ℝ^{256×256
                                                Ŝ_{t+1} ∈ ℝ^{256×256}
                                                        │
                              weighted_mean(Ŝ_{t+1}, w) ∈ ℝ^{256}
-                                   w = patch_weights (attn or Δs)
+                                   w = patch_weights (method-dependent)
                                                        │
                                    reward = cos_sim(z_rollout, z_goal)
-                                   → object patches dominate → discriminative
 ```
 
 ---
 
 ## 2. 아키텍처
 
-### 2.1 SWMEncoder 변경 (`models/encoder.py`)
+### 2.1 SWMEncoder (`models/encoder.py`)
 
 ```python
-# Stage 1 동결, Stage 2에서 spatial_proj만 추가 학습
 self.spatial_proj = nn.Sequential(
     nn.Linear(latent_dim, spatial_dim),   # 2176 → 256
     nn.LayerNorm(spatial_dim),
 )
 
 def encode_spatial_projected(self, image):
-    # DINOv2+SigLIP patch tokens → spatial_proj → (B, 256, 256)
     patch_features = self._get_patch_tokens(image)   # (B, 256, 2176)
     return self.spatial_proj(patch_features)          # (B, 256, 256)
 ```
@@ -71,24 +70,6 @@ def encode_spatial_projected(self, image):
 Stage 1 (DINOv2+SigLIP)은 완전 동결. `spatial_proj`만 Stage 2에서 학습됨.
 
 ### 2.2 SpatialSWMTransition (`models/transition.py`)
-
-```python
-class SpatialSWMTransition(nn.Module):
-    """
-    입력: S_t (B, N, d_s) + action (B, 7)
-    출력: S_{t+1} (B, N, d_s)
-
-    Action을 token으로 prepend → 257-token Transformer self-attention
-    → action token이 어떤 patch에 attend하는지가 task-relevant patch를 결정
-    """
-    def forward(self, s_t, action):
-        x = self.token_embed(s_t)               # (B, 256, hidden)
-        a = self.action_embed(action).unsqueeze(1)  # (B, 1, hidden)
-        x = torch.cat([a, x], dim=1)            # (B, 257, hidden)
-        x = self.blocks(x)                      # 6-layer Transformer
-        x = self.norm(x[:, 1:, :])              # drop action token
-        return self.out(x)                      # (B, 256, d_s)
-```
 
 | 항목 | Phase 1 SWMTransition | Phase 2 SpatialSWMTransition |
 |---|---|---|
@@ -99,36 +80,43 @@ class SpatialSWMTransition(nn.Module):
 | Parameters | 10.4M | 19.2M |
 | Loss | L2 | per-patch L1 |
 
-**핵심 특성**: 257개 토큰이 single forward pass에서 전부 attend → action token(index 0)의 patch token(1~256)에 대한 attention weight가 곧 "이 action을 실행할 때 중요한 patch"를 나타냄.
-
-### 2.3 Patch Weight 방법
-
-#### 방법 A: Attention Map (`patch_weight_method: attn`)
 ```python
-def get_patch_weights(self, s_t, action, top_k=64):
-    # 마지막 Transformer layer action→patch attention 추출
-    _, attn = last_layer.self_attn(x_norm, x_norm, x_norm,
-        need_weights=True, average_attn_weights=True)  # (B, 257, 257)
-    patch_w = attn[:, 0, 1:].mean(0)  # action token → patch tokens, (256,)
-    # top-k sparse mask: top-64 patch만 활성화
-    patch_w = patch_w * top_k_mask
-    return patch_w / patch_w.sum()
+def forward(self, s_t, action):
+    x = torch.cat([self.action_embed(action).unsqueeze(1),
+                   self.token_embed(s_t)], dim=1)    # (B, 257, hidden)
+    x = self.blocks(x)                               # 6-layer Transformer
+    return self.out(self.norm(x[:, 1:, :]))          # (B, 256, d_s)
 ```
 
-- 학습된 attention이 task-relevant patch를 자동으로 식별
-- top-k=64 → 전체의 25% patch만 사용
+### 2.3 Patch Weight 방법 (총 4종)
 
-#### 방법 B: Δs Magnitude (`patch_weight_method: delta`)
+| 방법 | 원리 | Top-1 weight | Entropy (max=4.159) |
+|---|---|---|---|
+| `none` | uniform mean-pool | 0.0039 | 5.545 (=log256) |
+| `attn` | 마지막 layer action→patch attention | **0.097** | 3.747 |
+| `delta` | \|\|Ŝ_{t+1} - S_t\|\|₂ per patch | 0.016 | **4.159** |
+| `dino_attn` | DINOv2 CLS→patch attention (frozen) | TBD | TBD |
+| `pca_variance` | Patch feature variance across demos | TBD | TBD |
+
+**핵심 발견 (patch weight analysis, n=200 samples):**
+- `attn`은 top-1 patch에 weight의 9.7%가 집중 (uniform 대비 6.2배). 이는 특정 patch에 reward가 과도하게 편중되어 reward saturation을 유발함
+- `delta`는 거의 완벽하게 uniform (entropy = max). Task-relevant signal이 희석됨
+- `attn` vs `delta` top-64 IoU = 0.229 (random baseline = 0.250): 두 방법이 서로 다른 patch를 선택하며, 어느 쪽도 실제 task-relevant region과 align되지 않을 가능성이 높음
+
 ```python
-def get_delta_weights(self, s_t, action, top_k=64):
-    s_next = self.forward(s_t, action)
-    delta = (s_next - s_t).norm(dim=-1).mean(0)  # (256,) per-patch change
-    delta = delta * top_k_mask
-    return delta / delta.sum()
-```
+# attn: action token → patch attention (transition model 의존)
+patch_w = last_layer_attn[:, 0, 1:].mean(0)  # (256,)
 
-- Action으로 인해 실제로 변화한 patch를 중요도로 사용
-- 물체 patch는 크게 변하고, 배경 patch는 거의 변하지 않음
+# delta: prediction change magnitude (transition model 의존)
+delta = (s_next - s_t).norm(dim=-1).mean(0)   # (256,)
+
+# dino_attn: DINOv2 CLS attention via forward hook (transition 불필요)
+handle = dino.blocks[-1].attn.register_forward_hook(_hook)
+dino.forward_features(dino_img)  # hook captures CLS→patch[-256:] attn
+
+# pca_variance: per-patch feature norm variance across demos
+var_i = E[||s_t^i||²] - E[||s_t^i||]²  # high variance = task-discriminative
+```
 
 ---
 
@@ -140,293 +128,377 @@ def get_delta_weights(self, s_t, action, top_k=64):
 # configs/stage2_spatial_multitask.yaml
 data:
   tasks: [square, coffee, stack_three, three_piece_assembly]
-  train_pairs: 315,432   # MimicGen 4tasks + RoboMimic 3tasks
+  train_pairs: 315,432
   val_pairs: 35,300
-
 transition:
   use_spatial: true
-  spatial_dim: 256       # d_s
+  spatial_dim: 256
   hidden_dim: 512
   num_layers: 6
   num_heads: 8
-
 training:
-  batch_size: 512        # GPU 2-7, 6-GPU DDP
-  lr: 3.0e-4             # 안정적 fine-tune lr (1e-3은 발산 확인)
+  batch_size: 512   # 6-GPU DDP
+  lr: 3.0e-4
   epochs: 50
   loss: per-patch L1
 ```
 
-### 3.2 학습 결과
+### 3.2 학습 곡선 및 안정성 이슈
 
-| 시도 | lr | 결과 |
-|---|---|---|
-| 최초 (bs=512) | 3.2e-3 (linear scaling) | epoch 6 발산 (val spike) |
-| resume (epoch3) | 1e-3 | optimizer state 미로드 → 발산 |
-| **현재** | **3e-4** (optimizer state 포함) | **epoch 5: val=0.0630 ★** |
+| 시도 | lr | 결과 | 원인 |
+|---|---|---|---|
+| 최초 | 3.2e-3 (linear scaling) | epoch 6 발산 | lr 과다 |
+| resume | 1e-3 | optimizer state 미로드 → 발산 | optimizer cold-start |
+| **현재** | **3e-4** (optimizer state 포함) | **epoch 5: val=0.0630 ★** | 안정 |
 
-Stage 2 best checkpoint: `outputs/stage2/spatial_multitask/best.pt` (epoch 5, val=0.0630)
-
-optimizer/scheduler/scaler state 저장 포함 (이후 resume 안정성 확보):
+optimizer/scheduler/scaler state를 체크포인트에 포함하고 resume 시 lr을 config에서 override하는 방식으로 안정화:
 ```python
-ckpt = {
-    "transition": ..., "spatial_proj": ...,
-    "optimizer": optimizer.state_dict(),
-    "scheduler": scheduler.state_dict(),
-    "scaler": scaler.state_dict(),
-}
+ckpt = {"transition": ..., "spatial_proj": ...,
+        "optimizer": opt.state_dict(), "scheduler": sch.state_dict(), "scaler": sc.state_dict()}
+# resume:
+opt.load_state_dict(ckpt["optimizer"])
+for pg in opt.param_groups: pg["lr"] = cfg.training.lr  # override
 ```
 
 ---
 
 ## 4. PCA-Adaptive Multi-Goal Reward
 
-### 4.1 Phase 1 고정 temporal goal의 문제
-
-```
-Phase 1: goal frames = {T×0.25, T×0.50, T×0.75, T×1.0}
-문제: 시간 기반 분할이 의미론적 phase와 불일치
-→ t=25%에서 robot이 아직 물체에 접근 중이거나 이미 집었을 수 있음
-→ reward가 실제 task progress와 misaligned
-```
-
-### 4.2 PCA-Adaptive Goal 알고리즘
+### 4.1 PCA-Adaptive Goal 알고리즘
 
 ```python
-# demo trajectory를 PCA 공간에서 linear progress로 분석
-pca_vecs = pca.transform(encoded_frames)       # (T', n_pca=16)
-direction = pca_vecs[-1] - pca_vecs[0]         # start→end 방향벡터
-proj_t = dot(pca_vecs[t] - pca_vecs[0], direction) / ||direction||²
+pca_vecs = pca.transform(encoded_frames)          # (T, n_pca=16)
+direction = pca_vecs[-1] - pca_vecs[0]
+proj_t    = dot(pca_vecs[t] - pca_vecs[0], direction) / ||direction||²
 
-# start→end 방향 progress가 threshold만큼 증가할 때마다 goal 추가
+goals = []
 last_proj = 0.0
 for t, proj in enumerate(projections):
-    if proj - last_proj >= pca_goal_threshold:  # = 0.3
-        goal_frames.append(t)
+    if proj - last_proj >= pca_goal_threshold:     # = 0.3
+        goals.append(t)
         last_proj = proj
-goal_frames.append(T-1)  # 마지막 프레임 항상 포함
+goals.append(T-1)   # 마지막 프레임 항상 포함
+# → 평균 3–4 goals per demo (vs fixed K=4 temporal)
 ```
 
-| threshold | 평균 goal 수 | 특성 |
-|---|---|---|
-| 0.2 | ~5–6 | 세밀, reward 분산 작음 |
-| **0.3** | **~3–4** | **의미론적 phase (사용)** |
-| 0.5 | ~2–3 | 거침, sparse reward |
-
-### 4.3 Binary Reward 계산
+### 4.2 Binary Reward 계산
 
 ```python
-# 각 goal k에 대해:
-z_pred = transition.rollout(z_init, actions)    # (B, T, d_s)
-z_pred_pooled = weighted_mean(z_pred, patch_w)  # (B, T, d_s)
-z_goal_pooled = weighted_mean(z_goal_k, patch_w)
-
-cos_k = cos_sim(z_pred_pooled[:, -1], z_goal_pooled)  # per-rollout
-progress_k = (cos_k - cos_init_k) / (1 - cos_init_k + ε)
-binary_k = float(progress_k > phase_threshold)   # 0 or 1
+progress_k = (cos_sim(z_pred, z_goal_k) - cos_init_k) / (1 - cos_init_k + ε)
+binary_k   = float(progress_k > phase_threshold)   # 0 or 1
 
 reward = mean(binary_k for k in goals)
-# reward ∈ {0, 1/K, 2/K, ..., 1}  where K = # adaptive goals
+# reward ∈ {0, 1/K, 2/K, ..., 1}
 ```
 
 GRPO advantage: `A_i = (r_i - μ_group) / (σ_group + ε)`
-Binary reward는 group 내 분산을 보장 (일부 rollout이 goal을 달성하고 일부는 못 달성).
 
 ---
 
-## 5. 실험 설계 (2 × 3 Factorial Ablation)
+## 5. 실험 설계
 
 ### 5.1 실험 행렬
 
-| | No Patch Weight | Attn Weight | Δs Weight |
+**Round 1: 2×3 Factorial Ablation (phase_threshold=0.3, chain1–6)**
+
+| | No Weight | Attn Weight | Δs Weight |
 |---|---|---|---|
-| **PCA Multi-Goal** | **Exp 1** (chain1) | **Exp 3** (chain3) | **Exp 5** (chain5) |
-| **PCA Binary** | **Exp 2** (chain2) | **Exp 4** (chain4) | **Exp 6** (chain6) |
+| **PCA Multi-Goal** | Exp 1 (chain1) | Exp 3 (chain3) | Exp 5 (chain5) |
+| **PCA Binary** | Exp 2 (chain2) | Exp 4 (chain4) | Exp 6 (chain6) |
 
-- **행 (Reward Type)**: goal 생성 방식 비교
-  - `pca_multi_goal`: PCA adaptive threshold (semantic phases)
-  - `pca_binary`: fixed K=4 temporal goals (Phase 1 방식)
-- **열 (Patch Weighting)**: reward 공간의 patch 선택 방식 비교
-  - `none`: uniform mean-pool (baseline)
-  - `attn`: last-layer action→patch attention
-  - `delta`: ||Ŝ_{t+1} - S_t||₂ magnitude
+**Round 2: threshold ablation (chain7–8)**
 
-**Phase 1 baseline** (비교 기준): 26% SR (pca_binary, scalar SWM)
+| | No Weight | phase_threshold |
+|---|---|---|
+| **PCA Multi-Goal** | chain7 | 0.6 |
+| **PCA Binary** | chain8 | 0.6 |
 
-### 5.2 실험별 설정
+**Round 3: Improved patch selection (chain9–12)**
 
-| Exp | Config | n_goals | patch_weight | temperature |
-|---|---|---|---|---|
-| 1 | stage3_spatial_pca_multi_goal | pca_adaptive (thresh=0.3) | none | 1.2 |
-| 2 | stage3_spatial_pca_binary | 4 (fixed) | none | 1.2 |
-| 3 | stage3_spatial_pca_multi_goal_attn | pca_adaptive | attn (top-64) | 1.2 |
-| 4 | stage3_spatial_pca_binary_attn | 4 (fixed) | attn (top-64) | 1.2 |
-| 5 | stage3_spatial_pca_multi_goal_delta | pca_adaptive | delta (top-64) | 1.2 |
-| 6 | stage3_spatial_pca_binary_delta | 4 (fixed) | delta (top-64) | 1.2 |
+| | DINO Attn | PCA Variance |
+|---|---|---|
+| **PCA Multi-Goal** | chain9 | chain11 |
+| **PCA Binary** | chain10 | chain12 |
 
 공통 GRPO 설정:
 ```yaml
-iterations: 200
-max_demos: 300
-n_states_per_iter: 4     # 4 initial states per iteration
-g_rollouts: 8            # 8 rollouts per state → group size 8
-temperature: 1.2
-lr: 5.0e-6
-clip_eps: 0.2
-kl_coef: 0.05
+iterations: 200,  g_rollouts: 8,  lr: 5.0e-6,  clip_eps: 0.2,  kl_coef: 0.05
 ```
 
-### 5.3 Chain 실행 구조
+### 5.2 Chain 실행 구조
 
 ```
-Chain A (GPU 2,3,4)          Chain B (GPU 5,6,7)
-────────────────────         ────────────────────
-chain1: pca_multi_goal   ||  chain2: pca_binary
-    ↓ eval done              ↓ eval done
-chain3: multi_goal_attn  ||  chain4: binary_attn
-    ↓ eval done              ↓ eval done
-chain5: multi_goal_delta ||  chain6: binary_delta
+Chain A (GPU 2,3,4)                  Chain B (GPU 5,6,7)
+─────────────────────────────────    ──────────────────────────────────
+chain1: pca_multi_goal (t=0.3)   ||  chain2: pca_binary (t=0.3)
+    ↓ eval done                       ↓ eval done
+chain3: multi_goal_attn (t=0.3)  ||  chain4: binary_attn (t=0.3)
+    ↓ eval done                       ↓ eval done
+chain5: multi_goal_delta (t=0.6) ||  chain6: binary_delta (t=0.6)
+    ↓ eval done                       ↓ eval done
+chain7: multi_goal (t=0.6)       ||  chain8: binary (t=0.6)
+    ↓ eval done                       ↓ eval done
+chain9:  multi_goal_dino (t=0.6) ||  chain10: binary_dino (t=0.6)
+    ↓ eval done                       ↓ eval done
+chain11: multi_goal_var (t=0.6)  ||  chain12: binary_var (t=0.6)
 ```
-
-- chain1 & chain2: 현재 동시 실행 중
-- chain3 & chain4: chain1/chain2 eval 완료 대기 중
-- chain5 & chain6: chain3/chain4 eval 완료 대기 중
-- 총 소요 예상: ~18–24h (각 chain: train ~4h + eval ~3h/GPU)
 
 ---
 
-## 6. 가설 및 예측
+## 6. 실험 결과 (Chain 1–8, COMPLETED)
 
-### 6.1 Primary Hypotheses
+### 6.1 Success Rate 결과
 
-**H1: Spatial > Scalar** (Exp 2 vs Phase 1 baseline)
-- `spatial_pca_binary` SR > 26% (Phase 1 pca_binary)
-- Mechanism: spatial_proj가 배경 patch의 변화 분산을 억제하여 reward discriminability 향상
+| Chain | 실험명 | Patch Weight | Phase Thresh | Best SR | Last SR |
+|---|---|---|---|---|---|
+| Phase 1 (scalar) | pca_binary (baseline) | — | 0.3 | — | **26%** |
+| SFT (no GRPO) | OpenVLA-OFT | — | — | — | 16% |
+| chain2 | pca_binary | none | 0.3 | 20% | **22%** |
+| chain1 | pca_multi_goal | none | 0.3 | 14% | 18% |
+| chain4 | pca_binary_attn | attn | 0.3 | 16% | 18% |
+| chain3 | pca_multi_goal_attn | attn | 0.3 | 10% | 14% |
+| chain6 | pca_binary_delta | delta | **0.6** | 10% | 14% |
+| chain5 | pca_multi_goal_delta | delta | **0.6** | 18% | **22%** |
+| chain8 | pca_binary_t06 | none | **0.6** | 18% | 18% |
+| chain7 | pca_multi_goal_t06 | none | **0.6** | 12% | 18% |
 
-**H2: Adaptive Goal > Fixed Goal** (Exp 1 vs Exp 2)
-- `spatial_pca_multi_goal` SR > `spatial_pca_binary`
-- Mechanism: semantic phase goals → better credit assignment → policy reaches intermediate milestones
+> **모든 Phase 2 실험이 Phase 1 scalar baseline (26%)를 넘지 못함.**
+> 최고 성능: 22% (chain2, chain5 last checkpoint)
 
-**H3: Patch Weighting Improves Reward** (Exp 3,4,5,6 vs Exp 1,2)
-- attn/delta weighted reward > uniform mean-pool reward
-- Mechanism: 배경 patch contribution 감소 → cos_sim 범위 확대 → 더 sharp한 reward signal
+### 6.2 Reward Variance 분석 (핵심 발견)
 
-**H4: Attn ≈ Delta** (Exp 3 vs Exp 5, Exp 4 vs Exp 6)
-- attention map과 Δs weight는 유사한 patch를 식별할 것으로 예측
-- Mechanism: well-trained transition에서 action token이 크게 변하는 patch를 attend할 것
+| 실험 | Reward mean | Reward std | Saturation (≥0.99) | 학습 상태 |
+|---|---|---|---|---|
+| pca_binary (chain2) | 0.158 | 0.098 | 0% | **정상** |
+| pca_multi_goal (chain1) | 0.217 | 0.122 | 0% | **정상** |
+| pca_binary_attn (chain4) | 0.998 | 0.012 | **96%** | ❌ saturation |
+| pca_multi_goal_attn (chain3) | 1.000 | 0.000 | **100%** | ❌ saturation |
+| pca_binary_delta (chain6) | 0.007 | 0.022 | 0% | ❌ collapse |
+| pca_multi_goal_delta (chain5) | 0.003 | 0.013 | 0% | ❌ collapse |
+| pca_binary_t06 (chain8) | 0.005 | 0.016 | 0% | ❌ collapse |
+| pca_multi_goal_t06 (chain7) | 0.001 | 0.008 | 0% | ❌ collapse |
 
-### 6.2 예상 결과 순위
+**분석:**
+- `attn` (chain3,4): reward=1.0 saturation → group σ≈0 → advantage≈0 → gradient≈0. attn weight가 특정 patch에 과도하게 집중(top-1 = 9.7%, uniform의 6.2배)하여 해당 patch의 cosine similarity 변화가 모든 rollout에서 threshold를 쉽게 초과
+- `delta` (chain5,6) + `t06` (chain7,8): reward≈0 → 반대 방향 붕괴. delta는 균등 분포(entropy=max)로 signal이 희석; t=0.6은 threshold가 너무 높아 모든 rollout이 credit을 받지 못함
+- **patch weight 없는 t=0.3 (chain1,2)만 reward variance가 충분하여 GRPO가 실제로 작동함**
 
-```
-multi_goal_attn ≈ multi_goal_delta  >  multi_goal
-        >
-binary_attn ≈ binary_delta  >  binary  >  Phase1 baseline(26%)
-```
+### 6.3 Phase 1 vs Phase 2 비교 분석
 
-### 6.3 실패 시나리오 및 대응
-
-| 시나리오 | 원인 | 대응 |
+| 요인 | Phase 1 Scalar | Phase 2 Spatial |
 |---|---|---|
-| binary == multi_goal | goal 수가 reward variance에 미치는 영향 미미 | threshold 조정 실험 |
-| patch_weight 효과 없음 | val=0.063인 transition이 아직 uninformative | Stage 2 더 학습 후 재실험 |
-| 전체 SR < 26% | spatial feature가 reward 공간으로 부적합 | spatial_proj fine-tuning (reward task-specific) |
+| Transition space | ℝ²¹⁷⁶ scalar | ℝ^{256×256} spatial |
+| Stage 2 val loss | 0.0789 (L2) | 0.0630 (L1, per-patch) |
+| Reward mean | ~0.15–0.25 | ~0.16–0.22 (patch-weight 없을 때) |
+| Reward variance (σ) | ~0.07–0.08 | ~0.10–0.12 |
+| Best SR | **26%** | 22% |
+
+Phase 2 spatial이 오히려 낮은 원인 가설:
+1. **Spatial transition의 reward noise**: 256개 patch 각각의 cosine similarity를 aggregating하는 과정에서 noise가 증가
+2. **Stage 2 transition의 품질**: val=0.063이지만, spatial transition이 배경 patch를 얼마나 잘 억제하는지는 미검증
+3. **Patch weight misalignment**: attn/delta가 task-relevant patch를 제대로 선택하지 못함 (IoU=0.229, 실질적으로 random 수준)
 
 ---
 
-## 7. Paper 구성 제안
+## 7. Patch Weight 방법 비교 (정량 분석)
 
-### 7.1 주장 구조
+### 7.1 Patch Selection Agreement
+
+```
+분석 설정: n=200 samples, top_k=64
+Random baseline IoU: 64/256 = 0.250
+
+Results:
+  attn vs delta top-64 IoU:      0.229 ± 0.075  ← random보다 낮음
+  attn vs delta Spearman ρ:      0.321 ± 0.144  ← 약한 양의 상관
+```
+
+attn과 delta가 서로 다른 패치를 선택하며, IoU가 random baseline보다 낮다는 것은 두 방법이 독립적으로 다른 기준을 사용함을 의미한다.
+
+### 7.2 Weight Concentration (n=20 random inputs)
+
+```
+                     Top-1 weight    Entropy       비고
+─────────────────────────────────────────────────────
+attn   (top_k=64)    0.097          3.747         고집중
+delta  (top_k=64)    0.016          4.159 (max)   균등
+uniform (top_k=256)  0.004          5.545 (max)   기준
+─────────────────────────────────────────────────────
+Uniform top-k=64:    1/64 = 0.0156  log(64)=4.159
+```
+
+**핵심 문제:**
+- `attn`은 특정 patch에 reward를 편중시켜 → saturation
+- `delta`는 너무 균등하게 퍼뜨려 → signal 희석 → reward collapse
+- 두 방법 모두 transition model 학습의 부산물이며, task completion과 직접적으로 align되지 않음
+
+### 7.3 Round 3 개선 방향 (chain9–12)
+
+#### DINO CLS Attention (`dino_attn`)
+DINOv2의 자기지도 학습으로 형성된 CLS→patch attention은 task object를 자연스럽게 highlight하는 것으로 알려져 있다. Transition model 학습 품질에 무관하며, 독립적인 prior로 활용 가능하다.
+
+```python
+# DINOv2 마지막 block CLS→patch attention via forward hook
+def _hook(module, inp, out):
+    x = inp[0]  # (B, N, C)
+    qkv = module.qkv(x).reshape(B, N, 3, heads, head_dim).permute(2,0,3,1,4)
+    q, k, _ = qkv.unbind(0)
+    attn = (q @ k.T) * module.scale
+    attn = attn.softmax(-1)
+    captured['attn'] = attn[:, :, 0, -256:].mean(1)  # CLS→patch[-256:]
+```
+
+- 장점: 학습 불필요, object-centric attention이 선행연구에서 검증됨
+- 예상: `attn`보다 덜 집중적이고, `delta`보다 semantically meaningful한 분포
+
+#### PCA Variance (`pca_variance`)
+Demo 전체 프레임에 걸친 patch feature variance를 기반으로 patch 중요도를 결정한다. 변동이 큰 patch = task state가 변하면서 달라지는 영역 = task-relevant.
+
+```python
+# Welford online algorithm for per-patch variance
+var_i = E_t[||s_t^i||²] - (E_t[||s_t^i||])²
+# top-k: 가장 변동이 큰 K개 patch 선택
+```
+
+- 장점: 실제 demo 데이터 기반, transition model에 무관
+- 예상: robot arm이 움직이는 패치 + 물체가 이동하는 패치를 선택
+
+---
+
+## 8. 가설 검증 결과
+
+| 가설 | 예측 | 실제 결과 | 판정 |
+|---|---|---|---|
+| H1: Spatial > Scalar | spatial_pca_binary > 26% | 22% < 26% | ❌ 기각 |
+| H2: Multi-goal > Binary | multi_goal > binary | 14% < 20% (best) | ❌ 기각 |
+| H3: Patch weight improves reward | attn/delta > none | attn: 10–16%, none: 14–22% | ❌ 기각 |
+| H4: Attn ≈ Delta | IoU ≈ 0.8+ | IoU = 0.229 (random수준) | ❌ 기각 |
+
+모든 가설이 기각됐으나, 이는 다음을 시사한다:
+- Spatial feature가 reward 공간으로 부적합한 것이 아니라, **patch weight 설계의 실패**가 주 원인
+- attn/delta는 서로 다른 patch를 선택하며 둘 다 reward signal 품질을 저하시킴
+- `none` (uniform mean-pool)이 가장 안정적인 reward variance를 제공하는 아이러니
+- **Round 3 (dino_attn + pca_variance)이 critical**: task-relevant patch selection이 가능하면 reward quality 개선 가능
+
+---
+
+## 9. Paper 구성 제안
+
+### 9.1 주장 구조 (실험 결과 반영)
 
 ```
 Problem: VLA post-training with GRPO needs informative dense rewards
-         → existing scalar world models suffer from background dominance
+         → scalar WM suffers from background dominance
 
 Method:
-  1. Spatial World Model (SpatialSWMTransition)
-     - patch-level prediction preserves task-relevant structure
-     - action token attention identifies task-relevant patches
-  2. PCA-Adaptive Goal Generation
-     - semantic phase detection vs temporal heuristics
-  3. Patch-Selective Reward Computation
-     - attention/delta-based weighted mean-pool
+  1. Spatial World Model (SpatialSWMTransition, 19.2M params)
+  2. PCA-Adaptive Goal Generation (semantic phases vs temporal)
+  3. Patch-Selective Reward (4 methods: none / attn / delta / dino_attn / pca_var)
 
-Experiments:
-  - 2×3 ablation on square manipulation task
-  - Comparison with Phase 1 (scalar SWM) baseline
-  - Analysis: patch weight visualization, reward variance, SR
+Key Findings:
+  - Spatial WM alone does not surpass scalar WM (22% vs 26%)
+  - Patch weight quality is the critical bottleneck:
+    * attn: reward saturation (concentration issue, top-1 = 6.2x uniform)
+    * delta: reward collapse (over-uniform, signal dilution)
+    * dino_attn / pca_variance: under investigation
+  - Reward variance, not architecture, determines GRPO effectiveness
 ```
 
-### 7.2 핵심 Figure 계획
+### 9.2 핵심 Figure 계획
 
 | Figure | 내용 |
 |---|---|
 | Fig 1 | Phase 1 vs Phase 2 pipeline 다이어그램 |
 | Fig 2 | PCA adaptive goal 시각화 (demo trajectory + goal frames) |
-| Fig 3 | Attention map / Δs weight 히트맵 (어떤 patch가 선택됐는지) |
-| Fig 4 | 2×3 실험 결과 막대그래프 (SR ± std) |
-| Fig 5 | Reward variance during training (GRPO advantage distribution) |
-| Tab 1 | Phase 1 vs Phase 2 전체 비교 테이블 |
+| Fig 3 | Patch weight 히트맵 비교: attn / delta / dino_attn / pca_variance |
+| Fig 4 | Reward variance during training (8 실험, distribution) |
+| Fig 5 | 전체 SR 결과 막대그래프 (chain1–12 vs baseline) |
+| Tab 1 | Patch weight analysis: top-1 concentration, entropy, IoU with dino_attn |
 
-### 7.3 Ablation 스토리라인
+### 9.3 Ablation 스토리라인
 
 ```
-[Scalar SWM baseline]: 26% SR
-    ↓ + Spatial SWM (Exp 2 vs Phase 1)
-[Spatial + Fixed Goal]: ? SR  → "spatial representation helps"
-    ↓ + Adaptive Goal (Exp 1 vs Exp 2)
-[Spatial + Adaptive Goal]: ? SR  → "semantic goals help"
-    ↓ + Patch Weighting (Exp 3,5 vs Exp 1 / Exp 4,6 vs Exp 2)
-[Spatial + Adaptive + Attn/Delta]: ? SR  → "patch selection helps"
+[SFT baseline]:             16% SR
+[Phase 1 scalar SWM]:       26% SR  (+10%p GRPO effect)
+    ↓ spatial WM, uniform pool (Exp 2 vs Phase 1)
+[Spatial + Fixed Goal]:     22% SR  (-4%p: spatial does not help with uniform pool)
+    ↓ adaptive vs fixed goal (Exp 1 vs Exp 2)
+[Spatial + Adaptive Goal]:  18% SR  (-4%p: adaptive goal also does not help)
+    ↓ patch weighting — why it fails (reward variance analysis)
+[attn/delta weight]:        10–16%  (reward saturation or collapse)
+    ↓ improved patch selection
+[dino_attn / pca_variance]: TBD
 ```
 
-각 단계가 독립적으로 기여하면 clean ablation story.
+Expected narrative: patch selection quality is the key variable; DINO-based selection should improve over learned transition-based selection.
 
 ---
 
-## 8. 파일 구조
+## 10. 파일 구조
 
 ```
 SWM/
 ├── configs/
 │   ├── stage2_spatial_multitask.yaml
-│   ├── stage3_spatial_pca_multi_goal.yaml         # Exp 1 (chain1)
-│   ├── stage3_spatial_pca_binary.yaml             # Exp 2 (chain2)
-│   ├── stage3_spatial_pca_multi_goal_attn.yaml    # Exp 3 (chain3)
-│   ├── stage3_spatial_pca_binary_attn.yaml        # Exp 4 (chain4)
-│   ├── stage3_spatial_pca_multi_goal_delta.yaml   # Exp 5 (chain5)
-│   └── stage3_spatial_pca_binary_delta.yaml       # Exp 6 (chain6)
+│   ├── stage3_spatial_pca_multi_goal.yaml              # chain1
+│   ├── stage3_spatial_pca_binary.yaml                  # chain2
+│   ├── stage3_spatial_pca_multi_goal_attn.yaml         # chain3
+│   ├── stage3_spatial_pca_binary_attn.yaml             # chain4
+│   ├── stage3_spatial_pca_multi_goal_delta.yaml        # chain5 (t=0.6)
+│   ├── stage3_spatial_pca_binary_delta.yaml            # chain6 (t=0.6)
+│   ├── stage3_spatial_pca_multi_goal_t06.yaml          # chain7
+│   ├── stage3_spatial_pca_binary_t06.yaml              # chain8
+│   ├── stage3_spatial_pca_multi_goal_dino_attn.yaml    # chain9
+│   ├── stage3_spatial_pca_binary_dino_attn.yaml        # chain10
+│   ├── stage3_spatial_pca_multi_goal_pca_variance.yaml # chain11
+│   └── stage3_spatial_pca_binary_pca_variance.yaml     # chain12
 ├── models/
-│   ├── encoder.py       # encode_spatial_projected()
-│   └── transition.py    # SpatialSWMTransition, get_patch_weights(), get_delta_weights()
+│   ├── encoder.py       # encode_spatial_projected(), spatial_proj
+│   └── transition.py    # SpatialSWMTransition, get_patch_weights(),
+│                        # get_delta_weights()
 ├── scripts/
 │   ├── train_stage2.py  # spatial DDP, optimizer state save/load
 │   ├── train_stage3.py  # spatial reward, pca_adaptive, patch_weights
+│   │                    # Methods: none / attn / delta / dino_attn / pca_variance
 │   └── phase2/
-│       ├── chain1_spatial_pca_multi_goal.sh      # Chain A-1 (GPU 2,3,4)
-│       ├── chain2_spatial_pca_binary.sh           # Chain B-1 (GPU 5,6,7)
-│       ├── chain3_spatial_pca_multi_goal_attn.sh  # Chain A-2 (GPU 2,3,4)
-│       ├── chain4_spatial_pca_binary_attn.sh      # Chain B-2 (GPU 5,6,7)
-│       ├── chain5_spatial_pca_multi_goal_delta.sh # Chain A-3 (GPU 2,3,4)
-│       └── chain6_spatial_pca_binary_delta.sh     # Chain B-3 (GPU 5,6,7)
+│       ├── chain1_spatial_pca_multi_goal.sh
+│       ├── chain2_spatial_pca_binary.sh
+│       ├── chain3_spatial_pca_multi_goal_attn.sh
+│       ├── chain4_spatial_pca_binary_attn.sh
+│       ├── chain5_spatial_pca_multi_goal_delta.sh
+│       ├── chain6_spatial_pca_binary_delta.sh
+│       ├── chain7_spatial_pca_multi_goal_t06.sh
+│       ├── chain8_spatial_pca_binary_t06.sh
+│       ├── chain9_spatial_pca_multi_goal_dino_attn.sh
+│       ├── chain10_spatial_pca_binary_dino_attn.sh
+│       ├── chain11_spatial_pca_multi_goal_pca_variance.sh
+│       └── chain12_spatial_pca_binary_pca_variance.sh
 └── eval/
-    └── eval_swm_mimicgen.py
+    ├── eval_swm_mimicgen.py          # TF GPU block fix (CUDA_VISIBLE_DEVICES="")
+    └── check_patch_weight_agreement.py  # attn/delta IoU analysis
 ```
 
 ---
 
-## 9. 현재 실행 상태 (2026-05-19)
+## 11. 현재 실행 상태 (2026-05-19 09:55)
 
 ```
-Chain A (GPU 2,3,4)
-├── chain1: RUNNING  — train_spatial_pca_multi_goal_20260518_235721.log
-├── chain3: WAITING  — for eval_spatial_pca_multi_goal_best.log
-└── chain5: WAITING  — for eval_spatial_pca_multi_goal_attn_best.log
+COMPLETED (chain1–8):
+  chain1: pca_multi_goal (t=0.3)          → best=14%, last=18%
+  chain2: pca_binary (t=0.3)              → best=20%, last=22%  ← Phase2 best
+  chain3: pca_multi_goal_attn (t=0.3)     → best=10%, last=14%  (reward saturated)
+  chain4: pca_binary_attn (t=0.3)         → best=16%, last=18%  (reward saturated)
+  chain5: pca_multi_goal_delta (t=0.6)    → best=18%, last=22%
+  chain6: pca_binary_delta (t=0.6)        → best=10%, last=14%  (reward collapsed)
+  chain7: pca_multi_goal_t06 (t=0.6)      → best=12%, last=18%  (reward collapsed)
+  chain8: pca_binary_t06 (t=0.6)          → best=18%, last=18%  (reward collapsed)
 
-Chain B (GPU 5,6,7)
-├── chain2: RUNNING  — train_spatial_pca_binary_20260518_235723.log
-├── chain4: WAITING  — for eval_spatial_pca_binary_best.log
-└── chain6: WAITING  — for eval_spatial_pca_binary_attn_best.log
+RUNNING (chain9–12):
+  chain9:  pca_multi_goal_dino_attn       GPU 2,3,4  training
+  chain10: pca_binary_dino_attn           GPU 5,6,7  training
+  chain11: pca_multi_goal_pca_variance    GPU 2,3,4  waiting for chain9 eval
+  chain12: pca_binary_pca_variance        GPU 5,6,7  waiting for chain10 eval
 
 Stage 2 checkpoint: outputs/stage2/spatial_multitask/best.pt
-  epoch=5, val_loss=0.0630 (L1, per-patch)
+  epoch=5, val_loss=0.0630 (per-patch L1)
 ```

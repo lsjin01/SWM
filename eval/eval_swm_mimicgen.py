@@ -44,15 +44,15 @@ from datetime import datetime
 import numpy as np
 import torch
 
-# TF import 전 GPU 차단
-os.environ["CUDA_VISIBLE_DEVICES_TF_BLOCK"] = "-1"
+# TF import 전 GPU 차단 (CUDA_VISIBLE_DEVICES 임시 비워야 TF가 GPU 초기화 안 함)
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
 try:
     import tensorflow as tf
     tf.config.set_visible_devices([], "GPU")
 except Exception:
     pass
 
-# 환경변수 복원
+# 환경변수 복원 (PyTorch는 이미 import된 후라 영향 없음)
 os.environ["CUDA_VISIBLE_DEVICES"] = _tf_vis
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
