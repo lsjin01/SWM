@@ -334,7 +334,7 @@ def train_one_epoch_spatial_robust(transition, encoder, loader, optimizer, scale
 
         for i in range(k):
             a        = action_seq[:, i]
-            s_target = s_all[:, i + 1].detach()
+            s_target = s_all[:, i + 1]
             w        = decay ** i
             w_total += w
 

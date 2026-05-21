@@ -138,34 +138,38 @@ def swm_rollout(
     device: torch.device,
     dtype: torch.dtype,
     patch_weights: torch.Tensor = None,  # (256,) CPU — spatial weighted mean pool
+    wm_bridge=None,   # NEW: nn.Linear(spatial_dim, 2176), spatial WM 전용
 ):
     """
-    수정된 SWM rollout:
-      - VLA: 초기 관측 image의 spatial patch features → projector → LLM
-             (256개 token 각자 다른 공간 정보 → train/eval 완전 일치)
+    수정된 SWM rollout (circulatory 구조):
+      - VLA: 매 chunk마다 WM transition 출력 z_t → wm_bridge → vla.projector → patch_embeds
+             (chunk 0: 초기 이미지 spatial patch features 사용)
       - WM:  global z_t → transition → z_t+1 (reward 계산 전용)
 
     Returns:
-        token_ids_list : list[Tensor(56,)]   각 chunk의 action tokens
-        logprobs_list  : list[float]          log-probabilities
-        patch_embeds_cpu: Tensor(1, 256, 4096) CPU (gradient recompute용)
-        z_history      : list[Tensor(1, 2176)]  WM latent history
+        token_ids_list   : list[Tensor(56,)]   각 chunk의 action tokens
+        logprobs_list    : list[float]          log-probabilities
+        rollout_data     : (z_at_chunk_start list, init_patch_embeds_cpu) tuple
+        z_history        : list[Tensor(1, 2176)]  WM latent history
     """
     z = z0.clone().to(device, dtype)
-    is_spatial = (z.ndim == 3)  # (B, N, d_s) vs (B, D)
+    is_spatial = (z.ndim == 3)
 
-    # ── 초기 이미지 → spatial patch embeddings (한 번만 계산) ────────────
+    # ── 초기 이미지 → spatial patch embeddings (chunk 0용) ────────────────
     with torch.no_grad():
         patch_embeds = image_to_patch_embeddings(image0, encoder, vla)  # (1, 256, 4096)
 
-    patch_embeds_cpu = patch_embeds.cpu()   # gradient recompute용 CPU 저장
+    init_patch_embeds_cpu = patch_embeds.cpu()   # gradient recompute용 CPU 저장
 
-    token_ids_list = []
-    logprobs_list  = []
-    z_history      = []
+    token_ids_list   = []
+    logprobs_list    = []
+    z_history        = []
+    z_at_chunk_start = []  # 각 chunk 시작 z (gradient recompute용 CPU 저장)
 
-    for _ in range(n_chunks):
-        # ── VLA: 동일한 spatial patch_embeds 사용 ─────────────────────────
+    for chunk_i in range(n_chunks):
+        z_at_chunk_start.append(z.clone().cpu())
+
+        # ── VLA: 현재 patch_embeds로 action 생성 ──────────────────────────
         with torch.no_grad():
             tids, lp = _vla_forward_patch_embeds(
                 patch_embeds, prompt_ids, attn_mask, vla, device, dtype, temperature
@@ -190,46 +194,101 @@ def swm_rollout(
                 else:
                     z_history.append(z.clone())
 
-    return token_ids_list, logprobs_list, patch_embeds_cpu, z_history
+        # ── Circulatory: patch_embeds 업데이트 (다음 chunk VLA 입력용) ────
+        if is_spatial and wm_bridge is not None:
+            with torch.no_grad():
+                vla_dtype = next(vla.projector.parameters()).dtype
+                z_up = wm_bridge(z.to(vla_dtype))          # (1, 256, 2176)
+                patch_embeds = vla.projector(z_up)         # (1, 256, 4096)
+        elif not is_spatial:
+            # Scalar WM: z (1, 2176) → repeat → vla.projector
+            with torch.no_grad():
+                vla_dtype = next(vla.projector.parameters()).dtype
+                z_rep = z.to(vla_dtype).unsqueeze(1).expand(-1, 256, -1)  # (1, 256, 2176)
+                patch_embeds = vla.projector(z_rep)        # (1, 256, 4096)
+        # is_spatial but no wm_bridge: keep same patch_embeds (backward compat)
+
+    rollout_data = (z_at_chunk_start, init_patch_embeds_cpu)
+    return token_ids_list, logprobs_list, rollout_data, z_history
+
+
+def _patch_embeds_from_z(z_cpu, vla, wm_bridge, device, dtype):
+    """z (CPU tensor) → patch_embeds (GPU tensor with grad).
+    Spatial WM: z (1, N, d_s) → wm_bridge → (1, N, 2176) → vla.projector → (1, N, 4096)
+    Scalar WM:  z (1, 2176)   → repeat(N) → vla.projector → (1, N, 4096)
+    """
+    vla_dtype = next(vla.projector.parameters()).dtype
+    z = z_cpu.to(device, vla_dtype)
+    if z.ndim == 3 and wm_bridge is not None:          # spatial
+        z_up = wm_bridge(z)                             # (1, N, 2176)
+    else:                                               # scalar
+        z_up = z.unsqueeze(1).expand(-1, 256, -1)       # (1, 256, 2176)
+    return vla.projector(z_up).to(dtype)                # (1, 256, 4096)
 
 
 def recompute_logprobs_grad(
-    patch_embeds_cpu: torch.Tensor,   # (1, 256, 4096)  공유 spatial embeddings
-    token_ids_list: list,             # list of (56,) Tensor
+    rollout_data,             # (z_at_chunk_cpu list, init_patch_embeds_cpu) OR legacy Tensor
+    token_ids_list: list,     # list of (56,) Tensor
     vla,
     prompt_ids: torch.Tensor,
     attn_mask: torch.Tensor,
     device: torch.device,
     dtype: torch.dtype,
+    wm_bridge=None,           # nn.Linear(spatial_dim, 2176) — circulatory 구조용
 ):
     """
     gradient 있는 log-prob 재계산 (GRPO backward용).
-    모든 chunk가 같은 patch_embeds를 공유 → 한 번만 GPU로 이동.
+    circulatory: chunk마다 z_t → wm_bridge → vla.projector → 개별 LLM forward.
+    legacy fallback: 단일 patch_embeds로 한 번만 LLM forward.
     """
-    patch_embeds = patch_embeds_cpu.to(device, dtype)
+    # ── circulatory mode ─────────────────────────────────────────────────────
+    if isinstance(rollout_data, tuple):
+        z_at_chunk_cpu, init_patch_embeds_cpu = rollout_data
+        input_ids_ext  = prompt_ids.clone()
+        placeholder    = torch.ones((1, NUM_ACTION_TOKENS), device=device, dtype=input_ids_ext.dtype)
+        stop           = torch.ones((1, 1),                  device=device, dtype=input_ids_ext.dtype) * 2
+        input_ids_full = torch.cat([input_ids_ext, placeholder, stop], dim=-1)
+        input_embeds   = vla.get_input_embeddings()(input_ids_full)
+        vis_mask  = torch.ones((1, NUM_VISION_TOKENS),       device=device, dtype=attn_mask.dtype)
+        ext_mask  = torch.ones((1, input_ids_full.shape[1]), device=device, dtype=attn_mask.dtype)
+        full_mask = torch.cat([vis_mask, ext_mask], dim=1)
 
+        lp_list = []
+        for i, tids in enumerate(token_ids_list):
+            if i == 0 or wm_bridge is None:
+                patch_embeds = init_patch_embeds_cpu.to(device, dtype)
+            else:
+                patch_embeds = _patch_embeds_from_z(
+                    z_at_chunk_cpu[i], vla, wm_bridge, device, dtype)
+            full_embeds = torch.cat([patch_embeds, input_embeds], dim=1)
+            out    = vla.language_model(inputs_embeds=full_embeds,
+                                        attention_mask=full_mask, use_cache=False)
+            logits = out.logits[:, -NUM_ACTION_TOKENS-2:-2]
+            lp = -F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)).float(),
+                tids.to(device).reshape(-1), reduction='sum',
+            )
+            lp_list.append(lp)
+        return lp_list
+
+    # ── legacy mode (단일 patch_embeds) ──────────────────────────────────────
+    patch_embeds = rollout_data.to(device, dtype)
     input_ids_ext  = prompt_ids.clone()
     placeholder    = torch.ones((1, NUM_ACTION_TOKENS), device=device, dtype=input_ids_ext.dtype)
     stop           = torch.ones((1, 1),                  device=device, dtype=input_ids_ext.dtype) * 2
     input_ids_full = torch.cat([input_ids_ext, placeholder, stop], dim=-1)
-
     input_embeds   = vla.get_input_embeddings()(input_ids_full)
     full_embeds    = torch.cat([patch_embeds, input_embeds], dim=1)
-
     vis_mask  = torch.ones((1, NUM_VISION_TOKENS),        device=device, dtype=attn_mask.dtype)
     ext_mask  = torch.ones((1, input_ids_full.shape[1]),  device=device, dtype=attn_mask.dtype)
     full_mask = torch.cat([vis_mask, ext_mask], dim=1)
-
     out    = vla.language_model(inputs_embeds=full_embeds, attention_mask=full_mask, use_cache=False)
-    logits = out.logits[:, -NUM_ACTION_TOKENS-2:-2]  # (1, 56, V)  off-by-one fix
-
+    logits = out.logits[:, -NUM_ACTION_TOKENS-2:-2]
     lp_list = []
     for tids in token_ids_list:
-        tgt = tids.to(device)
-        lp  = -F.cross_entropy(
+        lp = -F.cross_entropy(
             logits.reshape(-1, logits.size(-1)).float(),
-            tgt.reshape(-1),
-            reduction='sum',
+            tids.to(device).reshape(-1), reduction='sum',
         )
         lp_list.append(lp)
     return lp_list
@@ -1115,12 +1174,21 @@ def main():
         if is_main():
             log.info(f"RewardModel loaded from {rm_ckpt_path}  (frozen)")
 
+    # ── WM Bridge (Spatial SWM 전용: spatial_dim → 2176, circulatory 구조용) ──
+    wm_bridge = None
+    if use_spatial_swm:
+        wm_bridge = nn.Linear(spatial_dim_swm, 2176).to(device).to(dtype)
+        if is_main():
+            log.info(f"wm_bridge: Linear({spatial_dim_swm}, 2176)  [trainable]")
+
     # ── DDP 감싸기 ────────────────────────────────────────────────────────────
     if use_ddp:
         vla = DDP(vla, device_ids=[local_rank], find_unused_parameters=True)
 
     # ── Optimizer ─────────────────────────────────────────────────────────────
     trainable = [p for p in vla_raw.parameters() if p.requires_grad]
+    if wm_bridge is not None:
+        trainable = trainable + list(wm_bridge.parameters())
     optimizer = torch.optim.AdamW(
         trainable, lr=cfg.training.lr, weight_decay=0.01
     )
@@ -1135,6 +1203,8 @@ def main():
     if args.resume and Path(args.resume).exists():
         ckpt_r = torch.load(args.resume, map_location=device)
         vla_raw.load_state_dict(ckpt_r['vla'])
+        if wm_bridge is not None and 'wm_bridge' in ckpt_r:
+            wm_bridge.load_state_dict(ckpt_r['wm_bridge'])
         if 'optimizer' in ckpt_r:
             optimizer.load_state_dict(ckpt_r['optimizer'])
         if 'scheduler' in ckpt_r:
@@ -1175,10 +1245,10 @@ def main():
             goal   = init_goals[z0_idx]
 
             group_rewards = []
-            group_data    = []   # (tids_ep, lp_ep, patch_embeds_cpu) 저장
+            group_data    = []   # (tids_ep, lp_ep, rollout_data) 저장
 
             for _ in range(cfg.training.g_rollouts):
-                tids_ep, lp_ep, patch_embeds_cpu, z_hist = swm_rollout(
+                tids_ep, lp_ep, rollout_data, z_hist = swm_rollout(
                     z0, image0, encoder, transition, heads,
                     vla_raw, processor, p_ids, a_mask,
                     tokens_to_actions,
@@ -1186,6 +1256,7 @@ def main():
                     cfg.training.temperature,
                     device, dtype,
                     patch_weights=patch_weights,
+                    wm_bridge=wm_bridge,
                 )
                 if reward_type == 'transition_l2':
                     rew = transition_l2_reward(z_hist, goal, device)
@@ -1209,7 +1280,7 @@ def main():
                 else:
                     rew = graph_reward(z_hist, heads, goal, device)
                 group_rewards.append(rew)
-                group_data.append((tids_ep, lp_ep, patch_embeds_cpu))
+                group_data.append((tids_ep, lp_ep, rollout_data))
 
             iter_rewards.extend(group_rewards)
             gr = np.array(group_rewards)
@@ -1224,12 +1295,12 @@ def main():
             for mb_start in range(0, cfg.training.g_rollouts, mini_g):
                 mb_end = min(mb_start + mini_g, cfg.training.g_rollouts)
                 for g_idx in range(mb_start, mb_end):
-                    tids_ep, lp_ep, patch_embeds_cpu = group_data[g_idx]
+                    tids_ep, lp_ep, rollout_data = group_data[g_idx]
                     adv_scalar = float(adv_z[g_idx])
 
-                    # 같은 patch_embeds로 n_chunks log-probs 재계산
                     lp_new_list = recompute_logprobs_grad(
-                        patch_embeds_cpu, tids_ep, vla_raw, p_ids, a_mask, device, dtype
+                        rollout_data, tids_ep, vla_raw, p_ids, a_mask, device, dtype,
+                        wm_bridge=wm_bridge,
                     )
                     lp_old_list = lp_ep
                     adv_list    = [adv_scalar] * len(lp_new_list)
@@ -1281,6 +1352,8 @@ def main():
                 'scheduler': scheduler.state_dict(),
                 'reward_mean': mean_r,
             }
+            if wm_bridge is not None:
+                ckpt['wm_bridge'] = wm_bridge.state_dict()
             torch.save(ckpt, out_dir / f'ckpt_iter{iteration:04d}.pt')
             torch.save(ckpt, out_dir / 'last.pt')
             if mean_r > best_reward:
