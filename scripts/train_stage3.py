@@ -196,17 +196,23 @@ def swm_rollout(
 
         # ── Circulatory: patch_embeds 업데이트 (다음 chunk VLA 입력용) ────
         if is_spatial and wm_bridge is not None:
+            # spatial_dim<2176: bridge로 업샘플 후 projector
             with torch.no_grad():
                 vla_dtype = next(vla.projector.parameters()).dtype
                 z_up = wm_bridge(z.to(vla_dtype))          # (1, 256, 2176)
                 patch_embeds = vla.projector(z_up)         # (1, 256, 4096)
+        elif is_spatial and z.shape[-1] == 2176:
+            # spatial_dim=2176: transition 출력을 projector에 직접 입력
+            with torch.no_grad():
+                vla_dtype = next(vla.projector.parameters()).dtype
+                patch_embeds = vla.projector(z.to(vla_dtype))  # (1, 256, 4096)
         elif not is_spatial:
             # Scalar WM: z (1, 2176) → repeat → vla.projector
             with torch.no_grad():
                 vla_dtype = next(vla.projector.parameters()).dtype
                 z_rep = z.to(vla_dtype).unsqueeze(1).expand(-1, 256, -1)  # (1, 256, 2176)
                 patch_embeds = vla.projector(z_rep)        # (1, 256, 4096)
-        # is_spatial but no wm_bridge: keep same patch_embeds (backward compat)
+        # is_spatial, dim≠2176, no bridge: keep same patch_embeds (backward compat)
 
     rollout_data = (z_at_chunk_start, init_patch_embeds_cpu)
     return token_ids_list, logprobs_list, rollout_data, z_history
@@ -214,13 +220,16 @@ def swm_rollout(
 
 def _patch_embeds_from_z(z_cpu, vla, wm_bridge, device, dtype):
     """z (CPU tensor) → patch_embeds (GPU tensor with grad).
-    Spatial WM: z (1, N, d_s) → wm_bridge → (1, N, 2176) → vla.projector → (1, N, 4096)
-    Scalar WM:  z (1, 2176)   → repeat(N) → vla.projector → (1, N, 4096)
+    Spatial WM (bridge): z (1, N, d_s) → wm_bridge → (1, N, 2176) → projector → (1, N, 4096)
+    Spatial WM (2176):   z (1, N, 2176) → projector directly → (1, N, 4096)
+    Scalar WM:           z (1, 2176)   → repeat(N) → projector → (1, N, 4096)
     """
     vla_dtype = next(vla.projector.parameters()).dtype
     z = z_cpu.to(device, vla_dtype)
-    if z.ndim == 3 and wm_bridge is not None:          # spatial
+    if z.ndim == 3 and wm_bridge is not None:
         z_up = wm_bridge(z)                             # (1, N, 2176)
+    elif z.ndim == 3:                                   # spatial_dim=2176, no bridge
+        z_up = z                                        # (1, N, 2176)
     else:                                               # scalar
         z_up = z.unsqueeze(1).expand(-1, 256, -1)       # (1, 256, 2176)
     return vla.projector(z_up).to(dtype)                # (1, 256, 4096)
@@ -253,13 +262,21 @@ def recompute_logprobs_grad(
         ext_mask  = torch.ones((1, input_ids_full.shape[1]), device=device, dtype=attn_mask.dtype)
         full_mask = torch.cat([vis_mask, ext_mask], dim=1)
 
+        # spatial_dim=2176: transition output → projector directly (circulatory)
+        is_spatial_2176 = (
+            len(z_at_chunk_cpu) > 0 and
+            z_at_chunk_cpu[0].ndim == 3 and
+            z_at_chunk_cpu[0].shape[-1] == 2176
+        )
         lp_list = []
         for i, tids in enumerate(token_ids_list):
-            if i == 0 or wm_bridge is None:
+            if i == 0:
                 patch_embeds = init_patch_embeds_cpu.to(device, dtype)
-            else:
+            elif wm_bridge is not None or is_spatial_2176:
                 patch_embeds = _patch_embeds_from_z(
                     z_at_chunk_cpu[i], vla, wm_bridge, device, dtype)
+            else:
+                patch_embeds = init_patch_embeds_cpu.to(device, dtype)
             full_embeds = torch.cat([patch_embeds, input_embeds], dim=1)
             out    = vla.language_model(inputs_embeds=full_embeds,
                                         attention_mask=full_mask, use_cache=False)
@@ -978,11 +995,14 @@ def main():
             action_dim=7,
         ).to(device).to(dtype)
         transition.load_state_dict(s2_ckpt['transition'])
-        encoder.spatial_proj = nn.Sequential(
-            nn.Linear(2176, spatial_dim_swm),
-            nn.LayerNorm(spatial_dim_swm),
-        ).to(device)
-        encoder.spatial_proj.load_state_dict(s2_ckpt['spatial_proj'])
+        if spatial_dim_swm == 2176:
+            encoder.spatial_proj = nn.Identity().to(device)
+        else:
+            encoder.spatial_proj = nn.Sequential(
+                nn.Linear(2176, spatial_dim_swm),
+                nn.LayerNorm(spatial_dim_swm),
+            ).to(device)
+            encoder.spatial_proj.load_state_dict(s2_ckpt['spatial_proj'])
         encoder.spatial_dim = spatial_dim_swm
         for p in encoder.spatial_proj.parameters():
             p.requires_grad = False
@@ -1174,9 +1194,10 @@ def main():
         if is_main():
             log.info(f"RewardModel loaded from {rm_ckpt_path}  (frozen)")
 
-    # ── WM Bridge (Spatial SWM 전용: spatial_dim → 2176, circulatory 구조용) ──
+    # ── WM Bridge (spatial_dim<2176 전용: transition 출력을 projector 입력으로 업샘플)
+    # spatial_dim=2176이면 transition 출력이 이미 projector 입력과 동일 → 불필요
     wm_bridge = None
-    if use_spatial_swm:
+    if use_spatial_swm and spatial_dim_swm != 2176:
         wm_bridge = nn.Linear(spatial_dim_swm, 2176).to(device).to(dtype)
         if is_main():
             log.info(f"wm_bridge: Linear({spatial_dim_swm}, 2176)  [trainable]")

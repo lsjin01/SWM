@@ -155,10 +155,13 @@ class SWMEncoder(nn.Module):
                 nn.LayerNorm(latent_dim),
             )
         self.latent_dim = latent_dim
-        self.spatial_proj = nn.Sequential(
-            nn.Linear(self.backbone.embed_dim, spatial_dim),
-            nn.LayerNorm(spatial_dim),
-        )
+        if spatial_dim == self.backbone.embed_dim:
+            self.spatial_proj = nn.Identity()
+        else:
+            self.spatial_proj = nn.Sequential(
+                nn.Linear(self.backbone.embed_dim, spatial_dim),
+                nn.LayerNorm(spatial_dim),
+            )
         self.spatial_dim = spatial_dim
 
     def encode_spatial(self, image: torch.Tensor) -> torch.Tensor:
