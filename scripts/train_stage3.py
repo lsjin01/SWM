@@ -245,7 +245,7 @@ def grpo_loss_fn(lp_new_list, lp_old_list, advantages, clip_eps, kl_coef):
             torch.clamp(ratio, 1-clip_eps, 1+clip_eps) * adv_t
         )
         if kl_coef > 0:
-            surr = surr + kl_coef * (lp_old - lp_new)
+            surr = surr + kl_coef * (lp_new - lp_old)
         losses.append(surr)
     return torch.stack(losses).mean()
 
@@ -842,6 +842,8 @@ def parse_args():
     p.add_argument('--no-wandb',         action='store_true')
     p.add_argument('--resume',           type=str, default=None)
     p.add_argument('--debug',            action='store_true')
+    p.add_argument('--probe',            type=int, default=None,
+                   help='Run only N iters then print reward diagnostics and exit')
     return p.parse_args()
 
 
@@ -1037,6 +1039,7 @@ def main():
     reward_metric = cfg.get('reward_metric', 'cosine')
     phase_threshold = cfg.get('phase_threshold', None)
     reward_aggregation = cfg.get('reward_aggregation', 'mean')
+    reward_rank_normalize = cfg.get('reward_rank_normalize', False)
     spatial_pooling = cfg.get('spatial_pooling', 'mean')
     spatial_top_k   = cfg.get('spatial_top_k', 64)
 
@@ -1067,6 +1070,7 @@ def main():
     # ── PCA fit (pca_cosine / pca_delta_cosine) ──────────────────────────────
     # token_weights 전달 → spatial pooling 시 encode_weighted로 PCA 학습 (분포 일치)
     demo_pca = None
+    n_goals = cfg.get('n_goals', 1)
     if reward_metric in ('pca_cosine', 'pca_delta_cosine') or n_goals == 'pca_adaptive':
         n_pca = cfg.get('pca_components', 16)
         if is_main():
@@ -1080,7 +1084,6 @@ def main():
         log.info(f"Pre-encoding initial states ...  reward_type={reward_type}")
     # transition_l2: rollout_steps = n_rollout_chunks × NUM_ACTIONS_CHUNK
     rollout_steps = cfg.training.n_rollout_chunks * NUM_ACTIONS_CHUNK
-    n_goals = cfg.get('n_goals', 1)
     init_images, init_latents, init_goals = load_initial_states(
         cfg.data_root, task, encoder, cfg.training.max_demos, device, dtype,
         reward_type=reward_type,
@@ -1132,6 +1135,10 @@ def main():
     if args.resume and Path(args.resume).exists():
         ckpt_r = torch.load(args.resume, map_location=device)
         vla_raw.load_state_dict(ckpt_r['vla'])
+        if 'optimizer' in ckpt_r:
+            optimizer.load_state_dict(ckpt_r['optimizer'])
+        if 'scheduler' in ckpt_r:
+            scheduler.load_state_dict(ckpt_r['scheduler'])
         start_iter  = ckpt_r.get('iteration', 0) + 1
         best_reward = ckpt_r.get('reward_mean', -float('inf'))
         log.info(f"Resumed from {args.resume}  iter={start_iter-1}  reward={best_reward:.4f}")
@@ -1145,10 +1152,15 @@ def main():
     rng = random.Random(cfg.experiment.seed)
 
     # ── GRPO loop ─────────────────────────────────────────────────────────────
-    log.info(f"\n[GRPO] {cfg.training.iterations} iterations  "
+    total_iters = args.probe if args.probe else cfg.training.iterations
+    if args.probe:
+        log.info(f"\n[PROBE MODE] {args.probe} iters — reward diagnostics only")
+    log.info(f"\n[GRPO] {total_iters} iterations  "
              f"task={task}  g_rollouts={cfg.training.g_rollouts}")
 
-    for iteration in range(start_iter, cfg.training.iterations + 1):
+    probe_rewards_all = []   # for probe diagnostic summary
+
+    for iteration in range(start_iter, total_iters + 1):
         z0_batch = rng.sample(
             list(range(len(init_latents))),
             min(cfg.training.n_states_per_iter, len(init_latents))
@@ -1200,7 +1212,11 @@ def main():
                 group_data.append((tids_ep, lp_ep, patch_embeds_cpu))
 
             iter_rewards.extend(group_rewards)
-            gr    = np.array(group_rewards)
+            gr = np.array(group_rewards)
+            if reward_rank_normalize:
+                # force variance: replace raw rewards with rank scores in [-1, 1]
+                ranks = np.argsort(np.argsort(gr)).astype(float)
+                gr = (ranks / max(len(ranks) - 1, 1)) * 2.0 - 1.0
             adv_z = (gr - gr.mean()) / max(gr.std(), 1e-8)
 
             mini_g = cfg.training.get('mini_g', 0) or cfg.training.g_rollouts
@@ -1232,34 +1248,57 @@ def main():
         scheduler.step()
 
         mean_r = np.mean(iter_rewards) if iter_rewards else 0.0
+        std_r  = np.std(iter_rewards)  if iter_rewards else 0.0
+        min_r  = np.min(iter_rewards)  if iter_rewards else 0.0
+        max_r  = np.max(iter_rewards)  if iter_rewards else 0.0
+        nonzero_frac = np.mean(np.array(iter_rewards) != 0.0) if iter_rewards else 0.0
         if use_ddp:
             dist.barrier()
+
+        if args.probe:
+            probe_rewards_all.extend(iter_rewards)
 
         n_grads = len(z0_batch) * cfg.training.g_rollouts
         mean_loss = iter_loss_sum / max(n_grads, 1)
         if is_main() and iteration % cfg.training.log_every == 0:
             log.info(
-                f"[Iter {iteration:04d}]  reward={mean_r:.4f}  "
-                f"loss={mean_loss:.4f}  "
-                f"lr={scheduler.get_last_lr()[0]:.2e}"
+                f"[Iter {iteration:04d}]  reward={mean_r:.4f}  std={std_r:.4f}  "
+                f"[{min_r:.3f},{max_r:.3f}]  nonzero={nonzero_frac:.2f}  "
+                f"loss={mean_loss:.4f}  lr={scheduler.get_last_lr()[0]:.2e}"
             )
             if use_wandb:
                 import wandb
-                wandb.log({'reward': mean_r, 'loss': mean_loss, 'iteration': iteration})
+                wandb.log({'reward': mean_r, 'reward_std': std_r,
+                           'reward_min': min_r, 'reward_max': max_r,
+                           'nonzero_frac': nonzero_frac,
+                           'loss': mean_loss, 'iteration': iteration})
 
-        if is_main() and iteration % cfg.training.save_every == 0:
+        if not args.probe and is_main() and iteration % cfg.training.save_every == 0:
             ckpt = {
                 'iteration': iteration,
                 'vla': vla_raw.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
                 'reward_mean': mean_r,
             }
             torch.save(ckpt, out_dir / f'ckpt_iter{iteration:04d}.pt')
+            torch.save(ckpt, out_dir / 'last.pt')
             if mean_r > best_reward:
                 best_reward = mean_r
                 torch.save(ckpt, out_dir / 'best.pt')
                 log.info(f"  ★ New best reward={best_reward:.4f}")
 
-    if is_main():
+    if is_main() and args.probe:
+        arr = np.array(probe_rewards_all)
+        log.info(f"\n{'='*60}")
+        log.info(f"[PROBE RESULT]  n={len(arr)}  iters={args.probe}")
+        log.info(f"  mean={arr.mean():.4f}  std={arr.std():.4f}")
+        log.info(f"  min={arr.min():.4f}   max={arr.max():.4f}")
+        log.info(f"  nonzero={np.mean(arr != 0):.2f}")
+        verdict = "SIGNAL OK" if arr.std() > 0.05 else "DEAD SIGNAL (std<0.05)"
+        log.info(f"  → {verdict}")
+        log.info(f"{'='*60}")
+    elif is_main():
         log.info(f"Stage 3 done.  Best reward={best_reward:.4f}")
     if use_wandb:
         import wandb; wandb.finish()

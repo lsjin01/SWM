@@ -167,8 +167,8 @@ class SWMEncoder(nn.Module):
         # Identity proj인 경우 그대로 반환, 아니면 per-token projection 필요
         if isinstance(self.proj, nn.Identity):
             return spatial.float()
-        # Linear projection: (B, 256, 2176) → (B, 256, latent_dim)
-        return self.proj[0](spatial.float())  # Linear만 적용 (LayerNorm 생략)
+        # Linear + LayerNorm projection: (B, 256, 2176) → (B, 256, latent_dim)
+        return self.proj(spatial.float())
 
     def forward(self, image: torch.Tensor) -> torch.Tensor:
         """image (B,3,H,W) → global z_t (B, latent_dim) [transition / reward 전용]"""

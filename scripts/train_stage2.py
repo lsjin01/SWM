@@ -24,7 +24,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from models.encoder import SWMEncoder
 from models.heads import SWMHeads
 from models.transition import SWMTransition, SpatialSWMTransition
-from data.dataset import Stage2Dataset, MultiTaskStage2Dataset
+from data.dataset import (
+    Stage2Dataset, MultiTaskStage2Dataset,
+    MultiStepStage2Dataset, MultiTaskMultiStepStage2Dataset,
+)
 
 log = logging.getLogger(__name__)
 
@@ -287,6 +290,122 @@ def evaluate_spatial(transition, encoder, loader, cfg, device):
     return total / max(len(loader), 1)
 
 
+def train_one_epoch_spatial_robust(transition, encoder, loader, optimizer, scaler, cfg, device, epoch):
+    """
+    Robust Stage-2 trainer combining:
+      B) Multi-step unrolled loss  – loss = Σ_i decay^i * L1(ẑ_{t+i}, z_{t+i})
+      C) DAgger schedule           – p(dagger) linearly ramps from 0 → dagger_prob_end
+
+    Expects batches with keys: image_seq (B, k+1, C, H, W), action_seq (B, k, action_dim)
+    """
+    transition.train()
+    encoder.spatial_proj.train()
+
+    k           = cfg.training.get("multistep_k", 8)
+    decay       = cfg.training.get("multistep_decay", 0.7)
+    p_start     = cfg.training.get("dagger_prob_start", 0.0)
+    p_end       = cfg.training.get("dagger_prob_end", 0.5)
+    warmup_ep   = cfg.training.get("dagger_warmup_epochs", 20)
+    jepa_fn     = nn.L1Loss() if cfg.loss.jepa_loss == "l1" else nn.MSELoss()
+
+    # DAgger probability: linearly ramp from p_start → p_end over warmup_epochs
+    progress    = min(epoch / max(warmup_ep, 1), 1.0)
+    dagger_prob = p_start + (p_end - p_start) * progress
+
+    total = 0.0
+
+    for step, batch in enumerate(loader):
+        image_seq  = batch["image_seq"].to(device)   # (B, k+1, C, H, W)
+        action_seq = batch["action_seq"].to(device)  # (B, k, action_dim)
+
+        B, Kp1, C, H, W = image_seq.shape
+
+        # Encode all k+1 frames once (backbone frozen, spatial_proj trainable)
+        with torch.amp.autocast("cuda", enabled=cfg.training.amp):
+            imgs_flat = image_seq.view(B * Kp1, C, H, W)
+            s_all = encoder.encode_spatial_projected(imgs_flat)  # (B*(k+1), N, d)
+            N, d  = s_all.shape[1], s_all.shape[2]
+            s_all = s_all.view(B, Kp1, N, d)                     # (B, k+1, N, d)
+
+        # Unroll k steps
+        s_cur   = s_all[:, 0].detach()   # start from real z_0
+        loss    = torch.tensor(0.0, device=device)
+        w_total = 0.0
+
+        for i in range(k):
+            a        = action_seq[:, i]
+            s_target = s_all[:, i + 1].detach()
+            w        = decay ** i
+            w_total += w
+
+            with torch.amp.autocast("cuda", enabled=cfg.training.amp):
+                s_next = transition(s_cur, a)
+                loss   = loss + w * jepa_fn(s_next, s_target)
+
+            # DAgger: use predicted ẑ_{t+i} as next input with probability dagger_prob
+            if torch.rand(1).item() < dagger_prob:
+                s_cur = s_next.detach()
+            else:
+                s_cur = s_target   # teacher forcing
+
+        loss = loss / max(w_total, 1e-8)
+
+        optimizer.zero_grad()
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        raw_trans = transition.module if hasattr(transition, "module") else transition
+        nn.utils.clip_grad_norm_(
+            list(raw_trans.parameters()) + list(encoder.spatial_proj.parameters()),
+            cfg.training.grad_clip,
+        )
+        scaler.step(optimizer)
+        scaler.update()
+
+        total += loss.item()
+
+        if is_main() and step % cfg.training.log_interval == 0:
+            log.info(
+                f"Epoch {epoch:03d}  Step {step:04d}/{len(loader)}"
+                f"  loss={loss.item():.4f}"
+                f"  dagger_p={dagger_prob:.3f}"
+            )
+
+    return total / max(len(loader), 1)
+
+
+@torch.no_grad()
+def evaluate_spatial_robust(transition, encoder, loader, cfg, device):
+    """Evaluate with decay-weighted multi-step L1 (consistent with training loss)."""
+    transition.eval()
+    encoder.spatial_proj.eval()
+    jepa_fn = nn.L1Loss() if cfg.loss.jepa_loss == "l1" else nn.MSELoss()
+    decay   = cfg.training.get("multistep_decay", 0.7)
+    total   = 0.0
+    with torch.no_grad():
+        for batch in loader:
+            image_seq  = batch["image_seq"].to(device)
+            action_seq = batch["action_seq"].to(device)
+            B, Kp1, C, H, W = image_seq.shape
+            k = Kp1 - 1
+            with torch.amp.autocast("cuda", enabled=cfg.training.amp):
+                imgs_flat = image_seq.view(B * Kp1, C, H, W)
+                s_all = encoder.encode_spatial_projected(imgs_flat)
+                N, d  = s_all.shape[1], s_all.shape[2]
+                s_all = s_all.view(B, Kp1, N, d)
+                step_loss = 0.0
+                w_total   = 0.0
+                s_cur = s_all[:, 0]
+                for i in range(k):
+                    w = decay ** i
+                    s_next   = transition(s_cur, action_seq[:, i])
+                    s_target = s_all[:, i + 1]
+                    step_loss += w * jepa_fn(s_next, s_target).item()
+                    w_total   += w
+                    s_cur = s_target   # teacher forcing for eval
+                total += step_loss / max(w_total, 1e-8)
+    return total / max(len(loader), 1)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
@@ -334,6 +453,9 @@ def main():
     encoder, heads = load_frozen_stage1(cfg.stage1_ckpt, cfg, device)
 
     # ── Data ─────────────────────────────────────────────────────────────────
+    use_robust   = cfg.training.get("multistep_k", 1) > 1
+    multistep_k  = cfg.training.get("multistep_k", 1)
+
     # Combined (MimicGen + RoboMimic)
     if hasattr(cfg.data, "robomimic_root") and cfg.data.get("use_robomimic", False):
         from data.dataset import CombinedStage2Dataset
@@ -355,39 +477,47 @@ def main():
         )
     # MultiTask (MimicGen only)
     elif hasattr(cfg.data, "tasks"):
-        train_ds = MultiTaskStage2Dataset(
+        DS_cls = MultiTaskMultiStepStage2Dataset if use_robust else MultiTaskStage2Dataset
+        kw     = dict(multistep_k=multistep_k) if use_robust else {}
+        train_ds = DS_cls(
             data_root=cfg.data.data_root,
             tasks=list(cfg.data.tasks),
             split="train",
             train_ratio=cfg.data.train_split,
             image_size=cfg.data.image_size,
             seq_len=cfg.data.seq_len,
+            **kw,
         )
-        val_ds = MultiTaskStage2Dataset(
+        val_ds = DS_cls(
             data_root=cfg.data.data_root,
             tasks=list(cfg.data.tasks),
             split="val",
             train_ratio=cfg.data.train_split,
             image_size=cfg.data.image_size,
             seq_len=cfg.data.seq_len,
+            **kw,
         )
     # Single task
     else:
-        train_ds = Stage2Dataset(
+        DS_cls = MultiStepStage2Dataset if use_robust else Stage2Dataset
+        kw     = dict(multistep_k=multistep_k) if use_robust else {}
+        train_ds = DS_cls(
             data_root=cfg.data.data_root,
             task=cfg.data.task,
             split="train",
             train_ratio=cfg.data.train_split,
             image_size=cfg.data.image_size,
             seq_len=cfg.data.seq_len,
+            **kw,
         )
-        val_ds = Stage2Dataset(
+        val_ds = DS_cls(
             data_root=cfg.data.data_root,
             task=cfg.data.task,
             split="val",
             train_ratio=cfg.data.train_split,
             image_size=cfg.data.image_size,
             seq_len=cfg.data.seq_len,
+            **kw,
         )
 
     if args.debug:
@@ -496,7 +626,14 @@ def main():
         if use_ddp:
             train_sampler.set_epoch(epoch)
 
-        if use_spatial:
+        if use_spatial and use_robust:
+            tr_loss = train_one_epoch_spatial_robust(
+                transition, encoder, train_loader, optimizer, scaler, cfg, device, epoch
+            )
+            vl_loss = evaluate_spatial_robust(transition, encoder, val_loader, cfg, device)
+            tr = (tr_loss, 0.0, tr_loss)
+            vl = (vl_loss, 0.0, vl_loss)
+        elif use_spatial:
             tr_loss = train_one_epoch_spatial(
                 transition, encoder, train_loader, optimizer, scaler, cfg, device, epoch
             )
@@ -547,6 +684,9 @@ def main():
                 best_val = vl[0]
                 torch.save(ckpt, out_dir / "best.pt")
                 log.info(f"  ★ New best val_loss={best_val:.4f}")
+
+            # always overwrite last.pt
+            torch.save(ckpt, out_dir / "last.pt")
 
     if is_main():
         log.info(f"Stage 2 done.  Best val_loss={best_val:.4f}")

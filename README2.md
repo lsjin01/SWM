@@ -480,6 +480,64 @@ SWM/
 
 ---
 
+## 12. 전체 실험 결과 정리 (2026-05-20 기준)
+
+### Baselines
+
+| SR | 실험 |
+|---|---|
+| **40%** | WMPO P_1280 (fair) |
+| 30% | WMPO GRPO pixel |
+| 26% | JEPA GRPO |
+| 20% | SFT |
+
+### Phase 1 (Scalar SWM, original) — best per 실험
+
+| SR | 실험 |
+|---|---|
+| **24%** | diversity (best) |
+| **24%** | latent_cos (nozbp) |
+| 20% | action_pca_delta (best) |
+| 20% | pca_goal (reeval best) |
+| 16% | action_goal_v2 |
+| 16% | pca_goal_single |
+| 12% | pca_max |
+
+### Phase 2 (Spatial SWM, original) — best per 실험
+
+| SR | 실험 |
+|---|---|
+| **22%** | spatial_pca_binary_last |
+| **22%** | spatial_pca_multi_goal_delta_last |
+| 18% | spatial_pca_binary_attn_last |
+| 18% | spatial_pca_binary_dino_attn |
+| 18% | spatial_pca_binary_t06 |
+| 18% | spatial_pca_multi_goal_last |
+| 18% | spatial_pca_multi_goal_t06_last |
+| 16% | spatial_pca_multi_goal_dino_attn_last |
+| 14% | spatial_pca_multi_goal_attn_last |
+| 10% | spatial_pca_binary_delta_best |
+
+### Robust-B / Phase 2 — 완료된 6개 (binary 계열, 2026-05-20)
+
+> robust_b: Stage 2 transition을 multi-step unrolled loss (k=8)로 재학습. free-run cosine@t=160: -0.684 → **+0.968**
+
+| SR | 실험 |
+|---|---|
+| 18% | spatial_pca_binary_dino_attn_last |
+| 18% | spatial_pca_binary_t06_last |
+| 16% | spatial_pca_binary_dino_attn_best |
+| 16% | spatial_pca_binary_pca_variance_best |
+| 14% | spatial_pca_binary_best / delta_best |
+| 12% | spatial_pca_binary_attn_best / delta_last |
+| 10% | spatial_pca_binary_attn_last / pca_variance_last |
+
+**Robust-B Phase 1 unique (7개)**: chain 진행 중, 아직 결과 없음
+
+> 현재 `spatial_pca_multi_goal` 학습 중 (7/19번째). 이후 multi_goal 5개 → spatial_continuous_reward → Phase 1 unique 7개.
+
+---
+
 ## 11. 현재 실행 상태 (2026-05-19 09:55)
 
 ```

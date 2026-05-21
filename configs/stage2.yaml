@@ -34,8 +34,8 @@ loss:
 
 training:
   epochs: 50
-  batch_size: 16
-  lr: 5.0e-5
+  batch_size: 128
+  lr: 5.0e-4
   weight_decay: 1.0e-4
   grad_clip: 1.0
   amp: true

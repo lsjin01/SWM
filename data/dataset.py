@@ -506,6 +506,112 @@ class MultiTaskStage2Dataset(Dataset):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Multi-Step Stage2 Dataset  (B: multi-step loss  /  C: DAgger)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class MultiStepStage2Dataset(Dataset):
+    """
+    Returns k+1 consecutive frames and k actions for multi-step transition training.
+
+    batch keys:
+        image_seq : (k+1, 3, H, W)  – frames t, t+1, ..., t+k
+        action_seq: (k, action_dim)  – actions t, t+1, ..., t+k-1
+    """
+
+    def __init__(
+        self,
+        data_root: str,
+        task: str = "square",
+        split: str = "train",
+        train_ratio: float = 0.9,
+        image_size: int = 224,
+        seq_len: int = 16,
+        multistep_k: int = 8,
+        **kwargs,
+    ):
+        self.task      = task
+        self.split     = split
+        self.k         = multistep_k
+        self.transform = make_transforms(image_size, split)
+        self.hdf5_path = HDF5_PATH_TEMPLATE.format(
+            root=data_root.rstrip("/"), task=task)
+        assert Path(self.hdf5_path).exists(), f"Not found: {self.hdf5_path}"
+        self.index = self._build_index(train_ratio)
+        print(f"[MultiStepStage2/{split}] {task}: {len(self.index)} seqs (k={multistep_k})")
+
+    def _build_index(self, ratio: float) -> List[Tuple[str, int]]:
+        with h5py.File(self.hdf5_path, "r") as f:
+            demo_keys = sorted(f["data"].keys())
+        n_train = int(len(demo_keys) * ratio)
+        target  = demo_keys[:n_train] if self.split == "train" else demo_keys[n_train:]
+        seqs = []
+        with h5py.File(self.hdf5_path, "r") as f:
+            for dk in target:
+                T_len = f[f"data/{dk}/obs/agentview_image"].shape[0]
+                for t in range(T_len - self.k):
+                    seqs.append((dk, t))
+        if self.split == "train":
+            random.seed(42)
+            random.shuffle(seqs)
+        return seqs
+
+    def __len__(self): return len(self.index)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        dk, t = self.index[idx]
+        with h5py.File(self.hdf5_path, "r") as f:
+            imgs = f[f"data/{dk}/obs/agentview_image"][t : t + self.k + 1]   # (k+1, H, W, 3)
+            acts = f[f"data/{dk}/actions"][t : t + self.k]                    # (k, action_dim)
+
+        img_tensors = torch.stack([self.transform(imgs[i]) for i in range(self.k + 1)])
+        act_tensor  = torch.tensor(acts, dtype=torch.float32)
+        return {
+            "image_seq":  img_tensors,  # (k+1, 3, H, W)
+            "action_seq": act_tensor,   # (k, action_dim)
+        }
+
+
+class MultiTaskMultiStepStage2Dataset(Dataset):
+    """MultiTask version of MultiStepStage2Dataset."""
+
+    TASKS = ["square", "coffee", "stack_three", "three_piece_assembly"]
+
+    def __init__(
+        self,
+        data_root: str,
+        tasks: Optional[List[str]] = None,
+        split: str = "train",
+        train_ratio: float = 0.9,
+        image_size: int = 224,
+        seq_len: int = 16,
+        multistep_k: int = 8,
+    ):
+        self.datasets = [
+            MultiStepStage2Dataset(
+                data_root=data_root, task=t, split=split,
+                train_ratio=train_ratio, image_size=image_size,
+                multistep_k=multistep_k,
+            )
+            for t in (tasks or self.TASKS)
+        ]
+        self.index = [
+            (ds_i, s_i)
+            for ds_i, ds in enumerate(self.datasets)
+            for s_i in range(len(ds))
+        ]
+        if split == "train":
+            random.seed(42)
+            random.shuffle(self.index)
+        print(f"[MultiTaskMultiStep/{split}] {len(self.index)} total seqs")
+
+    def __len__(self):  return len(self.index)
+
+    def __getitem__(self, idx):
+        ds_i, s_i = self.index[idx]
+        return self.datasets[ds_i][s_i]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # RoboMimic Dataset
 # ─────────────────────────────────────────────────────────────────────────────
 

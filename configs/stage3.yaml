@@ -3,42 +3,25 @@ experiment:
   seed: 42
   output_dir: outputs/stage3/square
 
-data:
-  task: square
-  data_root: /NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO-JEPA/data
-  image_size: 224
-  num_workers: 2
+task: square
+unnorm_key: square_d0_300_demos
 
-stage1_ckpt: outputs/stage1/square/best.pt
-stage2_ckpt: outputs/stage2/square/best.pt
+vla_path: /NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO/checkpoint_files/SFT_models/square
+swm_ckpt: outputs/stage2/multitask_dinosiglip/best.pt
+stage1_ckpt: outputs/stage1/multitask_dinosiglip/best.pt
 
-policy:
-  openvla_ckpt: null          # OpenVLA-OFT checkpoint 경로
-  vjepa2_ac_ckpt: /home/dgist_shyo/.cache/torch/hub/checkpoints/vjepa2-ac-vitg.pt        # V-JEPA-2 encoder checkpoint (policy 내부용)
-  freeze_siglip: true         # SigLIP frozen (language alignment 보존)
-  freeze_vjepa: false         # V-JEPA-2 fine-tune
-  action_dim: 7
-  action_chunk_size: 4        # 4 actions per chunk → T=8이면 32 step horizon
-  use_peft: true
-  peft_r: 16
-  peft_alpha: 32
-
-grpo:
-  G: 8                        # trajectory 샘플 수
-  T: 8                        # rollout steps
-  reward_type: graph_distance
-  reward_temperature: 1.0
-  clip_epsilon: 0.2
-  kl_coef: 0.01
-  entropy_coef: 0.001
-  normalize_advantage: true
-  sampling_temperature: 1.0
+data_root: /NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO-JEPA/data
 
 training:
-  iterations: 100
-  lr: 1.0e-6
-  weight_decay: 0.0
+  iterations: 500
+  max_demos: 50
+  n_states_per_iter: 4
+  g_rollouts: 8
+  n_rollout_chunks: 4     # 4 chunks × 8 sub-steps = 32 action steps
+  temperature: 1.0
+  lr: 5.0e-6
+  clip_eps: 0.2
+  kl_coef: 0.01
   grad_clip: 1.0
-  amp: true
-  log_interval: 10
-  save_interval: 10
+  log_every: 10
+  save_every: 50

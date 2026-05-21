@@ -19,6 +19,9 @@ def test_stage1_dataset():
         image_size=224, max_nodes=8,
     )
     assert len(ds) > 0
+    # demo 단위 분리: 300 × 0.9 = 270 train demos
+    # frame 수는 demo별 trajectory 길이에 따라 다름
+    print(f"  Stage1 train frames: {len(ds)}")
 
     sample = ds[0]
     assert sample["image"].shape        == (3, 224, 224)
@@ -38,11 +41,11 @@ def test_stage2_dataset():
     )
     assert len(ds) > 0
     s = ds[0]
-    assert s["image_t"].shape    == (3, 224, 224)
-    assert s["image_t1"].shape   == (3, 224, 224)
-    assert s["action"].shape     == (7,)
+    assert s["image_t"].shape     == (3, 224, 224)
+    assert s["image_t1"].shape    == (3, 224, 224)
+    assert s["action"].shape      == (7,)
     assert s["node_pos_t1"].shape == (8, 3)
-    print(f"  Stage2 pairs: {len(ds)}")
+    print(f"  Stage2 train pairs: {len(ds)}")
 
 
 def test_goal_graph_dataset():
