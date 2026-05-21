@@ -480,7 +480,7 @@ SWM/
 
 ---
 
-## 12. 전체 실험 결과 정리 (2026-05-20 기준)
+## 12. 전체 실험 결과 정리 (2026-05-21 기준)
 
 ### Baselines
 
@@ -510,31 +510,56 @@ SWM/
 | **22%** | spatial_pca_binary_last |
 | **22%** | spatial_pca_multi_goal_delta_last |
 | 18% | spatial_pca_binary_attn_last |
-| 18% | spatial_pca_binary_dino_attn |
-| 18% | spatial_pca_binary_t06 |
+| 18% | spatial_pca_binary_dino_attn_best |
+| 18% | spatial_pca_binary_t06_best |
 | 18% | spatial_pca_multi_goal_last |
 | 18% | spatial_pca_multi_goal_t06_last |
 | 16% | spatial_pca_multi_goal_dino_attn_last |
 | 14% | spatial_pca_multi_goal_attn_last |
 | 10% | spatial_pca_binary_delta_best |
 
-### Robust-B / Phase 2 — 완료된 6개 (binary 계열, 2026-05-20)
+### Robust-B Phase 2 — 전체 19개 (2026-05-21, code fixes applied)
 
 > robust_b: Stage 2 transition을 multi-step unrolled loss (k=8)로 재학습. free-run cosine@t=160: -0.684 → **+0.968**
+> Code fixes: encoder LayerNorm, KL penalty sign, n_goals order, eval normalization, optimizer checkpoint
 
-| SR | 실험 |
-|---|---|
-| 18% | spatial_pca_binary_dino_attn_last |
-| 18% | spatial_pca_binary_t06_last |
-| 16% | spatial_pca_binary_dino_attn_best |
-| 16% | spatial_pca_binary_pca_variance_best |
-| 14% | spatial_pca_binary_best / delta_best |
-| 12% | spatial_pca_binary_attn_best / delta_last |
-| 10% | spatial_pca_binary_attn_last / pca_variance_last |
+#### Phase 2 Spatial 실험 (11개) — 원본 대비 비교
 
-**Robust-B Phase 1 unique (7개)**: chain 진행 중, 아직 결과 없음
+| # | 실험 | orig best | orig last | rb best | rb last | 변화 |
+|---|---|---|---|---|---|---|
+| 1 | spatial_pca_binary | 20% | **22%** | 10% | 18% | ↓ |
+| 2 | spatial_pca_binary_t06 | 18% | 18% | 12% | 18% | ~ |
+| 3 | spatial_pca_binary_attn | 16% | 18% | 10% | 12% | ↓ |
+| 4 | spatial_pca_binary_delta | 10% | 14% | **16%** | 10% | ↑ best |
+| 5 | spatial_pca_binary_dino_attn | 18% | 14% | 16% | 18% | ~ |
+| 6 | spatial_pca_binary_pca_variance | —  | — | **20%** | 14% | NEW |
+| 7 | spatial_pca_multi_goal | 14% | 18% | 8% | 14% | ↓ |
+| 8 | spatial_pca_multi_goal_t06 | 12% | 18% | **18%** | 16% | ↑ best |
+| 9 | spatial_pca_multi_goal_attn | 10% | 14% | 8% | **22%** | ↑ last |
+| 10 | spatial_pca_multi_goal_delta | 18% | **22%** | 10% | 18% | ↓ |
+| 11 | spatial_pca_multi_goal_dino_attn | 12% | 16% | 12% | 14% | ~ |
+| 12 | spatial_continuous_reward | — | — | 8% | 18% | NEW |
 
-> 현재 `spatial_pca_multi_goal` 학습 중 (7/19번째). 이후 multi_goal 5개 → spatial_continuous_reward → Phase 1 unique 7개.
+#### Phase 1 unique 실험 (7개) — robust_b Stage 2로 재평가
+
+| # | 실험 | Phase1 orig best | rb best | rb last |
+|---|---|---|---|---|
+| 13 | latent_cos | **24%** | 12% | 18% |
+| 14 | pca_goal | 20% | 14% | 18% |
+| 15 | pca_goal_single | 16% | 14% | 14% |
+| 16 | pca_max | 12% | **20%** | 12% |
+| 17 | diversity | **24%** | 14% | 10% |
+| 18 | action_goal | 16% | 14% | 14% |
+| 19 | action_pca_delta | 20% | 12% | 10% |
+
+#### 요약
+
+- **Robust-B 최고 SR**: 22% (spatial_pca_multi_goal_attn/last, spatial_pca_binary/last)
+- 원본 Phase 2 최고 대비 동일 (22%) — 평균은 소폭 하락
+- **pca_variance (new)**: 20% best — Phase 2 공동 최고
+- **개선된 실험 (best or last 기준)**: binary_delta, multi_goal_t06, multi_goal_attn, pca_max
+- **하락한 실험**: pca_binary, pca_binary_attn, multi_goal, multi_goal_delta, latent_cos, diversity
+- binary reward σ 문제 (이산값 분포 → 약한 GRPO 신호)가 주 원인으로 추정
 
 ---
 
