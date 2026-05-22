@@ -217,11 +217,14 @@ def load_swm_model(
     if "spatial_proj" in sd2:
         from models.transition import SpatialSWMTransition
         spatial_dim = sd2.get("spatial_dim", 256)
-        encoder.spatial_proj = torch.nn.Sequential(
-            torch.nn.Linear(latent_dim, spatial_dim),
-            torch.nn.LayerNorm(spatial_dim),
-        ).to(device)
-        encoder.spatial_proj.load_state_dict(sd2["spatial_proj"])
+        if spatial_dim == latent_dim:  # Identity case (rb3: spatial_dim=2176)
+            encoder.spatial_proj = torch.nn.Identity().to(device)
+        else:
+            encoder.spatial_proj = torch.nn.Sequential(
+                torch.nn.Linear(latent_dim, spatial_dim),
+                torch.nn.LayerNorm(spatial_dim),
+            ).to(device)
+            encoder.spatial_proj.load_state_dict(sd2["spatial_proj"])
         encoder.spatial_proj.eval()
         transition = SpatialSWMTransition(spatial_dim=spatial_dim).to(device)
         transition.load_state_dict(sd2["transition"])
