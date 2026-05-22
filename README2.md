@@ -585,3 +585,42 @@ RUNNING (chain9–12):
 Stage 2 checkpoint: outputs/stage2/spatial_multitask/best.pt
   epoch=5, val_loss=0.0630 (per-patch L1)
 ```
+
+---
+
+## 12. Robust-B3 — spatial_dim=2176, True Circulatory Structure (2026-05-22)
+
+### 핵심 변경사항
+
+| 항목 | rb2 | rb3 |
+|---|---|---|
+| spatial_dim | 256 | **2176** (backbone과 동일) |
+| spatial_proj | Linear(2176→256) + LN | **Identity** (압축 없음) |
+| wm_bridge | Linear(256→2176) | **없음** |
+| WM→VLA 연결 | image_0 patch_embeds 재사용 | **WM(z,a)→projector→LLM** (진짜 순환) |
+| Stage 2 val_loss | 0.1714 | 0.2327 |
+| Stage 2 transition params | ~21M | ~21M |
+
+> rb3부터 WM transition 출력이 vla.projector를 통해 LLM에 직접 입력됨.
+> chunk 0은 실제 이미지, chunk 1+는 WM 예측 spatial features 사용.
+
+### Stage 3 평가 결과 (2026-05-22, 진행 중 6/19)
+
+#### 완료된 실험 — rb3 vs rb2 비교
+
+| # | 실험 | rb3 best | rb3 last | rb2 best | rb2 last | 변화 |
+|---|---|---|---|---|---|---|
+| 1 | spatial_pca_binary | 12% | **20%** | 10% | 18% | ↑ |
+| 2 | spatial_pca_binary_t06 | **20%** | 12% | 12% | 18% | ↑ best |
+| 3 | spatial_pca_binary_attn | 16% | 16% | 10% | 12% | ↑ |
+| 4 | spatial_pca_binary_delta | 18% | 8% | **16%** | 10% | ↑ best |
+| 5 | spatial_pca_binary_dino_attn | 18% | 16% | 16% | 18% | ~ |
+| 6 | spatial_pca_binary_pca_variance | 18% | 12% | **20%** | 14% | ↓ best |
+
+#### 요약 (부분)
+
+- **rb3 최고 SR**: 20% (spatial_pca_binary/last, spatial_pca_binary_t06/best)
+- rb3 vs rb2: 6개 중 4개 개선, 1개 동일, 1개 하락 — 소폭 개선
+- SFT 베이스라인(20%) 수준 — WMPO p1280(40%)와 여전히 큰 격차
+- 순환구조 자체보다 **보상 신호 품질**이 주 병목으로 추정
+- 나머지 13개 실험 평가 진행 중 (pair 7&8 Iter 149/200, 2026-05-22 16:48 기준)
