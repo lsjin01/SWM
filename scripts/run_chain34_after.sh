@@ -8,5 +8,5 @@ while kill -0 "$WAIT_PID" 2>/dev/null; do sleep 60; done
 echo "[watcher $(date '+%F %T')] ①② 종료 감지 → ③④ 체인 시작"
 GPU=0 TASK=square \
   VARIANTS="full_tcn_only full_goaldist_only full_tcn_add full_goaldist_add" \
-  bash $SWM/run_chain.sh > $SWM/logs/chain_full34.log 2>&1
+  bash $SWM/scripts/run_chain.sh > $SWM/logs/chain_full34.log 2>&1
 echo "[watcher $(date '+%F %T')] ③④ 체인 종료"

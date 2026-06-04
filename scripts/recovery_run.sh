@@ -56,5 +56,5 @@ fi
 echo "[recover $(ts)] (B) pls_add + ③④ 체인 시작"
 GPU=0 TASK=$TASK \
   VARIANTS="full_pls_add full_tcn_only full_goaldist_only full_tcn_add full_goaldist_add" \
-  bash $SWM/run_chain.sh >> $SWM/logs/chain_recover.log 2>&1
+  bash $SWM/scripts/run_chain.sh >> $SWM/logs/chain_recover.log 2>&1
 echo "[recover $(ts)] ALL DONE"

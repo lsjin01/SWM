@@ -268,10 +268,10 @@ EMA(느린 reward LLM)가 rollout 에서 실제로 쓰이는지에 따라 두 �
 
 ## 8. 실험 진행
 
-### 8.1 자동 체인 (`run_chain.sh`)
+### 8.1 자동 체인 (`scripts/run_chain.sh`)
 변형마다: **train → export(HF) → verl eval → `chain_results.csv` 기록 → 정리(best.pt만 보존)**.
 ```bash
-GPU=0 TASK=square VARIANTS="full_probe_only full_pls_only full_probe_add full_pls_add" bash run_chain.sh
+GPU=0 TASK=square VARIANTS="full_probe_only full_pls_only full_probe_add full_pls_add" bash scripts/run_chain.sh
 ```
 - config: `configs/stage3_<variant>.yaml` (full_* = iter 100, g_rollouts 8, chunks 20, max_demos 300, n_states 8).
 - iteration=100 → WMPO(100 epoch)와 비교 가능하게 설정.

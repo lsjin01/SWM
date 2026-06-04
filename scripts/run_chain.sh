@@ -3,7 +3,7 @@
 # Stage3 reward 실험 자동 체인:  각 변형마다  train → export → verl eval → 기록 → 정리
 #
 # 사용:
-#   GPU=0 TASK=square VARIANTS="grounding_ema ema_only" bash run_chain.sh
+#   GPU=0 TASK=square VARIANTS="grounding_ema ema_only" bash scripts/run_chain.sh
 #   (VARIANTS = configs/stage3_<variant>.yaml 의 <variant> 목록)
 #
 # 결과: eval_results/chain_results.csv  (variant, train_best_reward, eval_SR)
