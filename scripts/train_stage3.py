@@ -90,6 +90,187 @@ def image_to_patch_embeddings(
     return vla.projector(spatial)                        # (B, 256, 4096)
 
 
+@torch.no_grad()
+def goal_pre_action_hidden(goal_image, encoder, vla, reward_lm, prompt_ids, attn_mask,
+                           device, dtype):
+    """goal 이미지(데모 마지막 프레임) → patch_embeds → reward LLM → action head 직전 hidden.
+    Returns (1, 56, H). EMA reward LLM이 goal을 인코딩한 target 표현(h_goal)."""
+    patch_embeds = image_to_patch_embeddings(goal_image.to(device), encoder, vla)  # (1,256,4096)
+    input_ids_ext  = prompt_ids.clone()
+    placeholder    = torch.ones((1, NUM_ACTION_TOKENS), device=device, dtype=input_ids_ext.dtype)
+    stop           = torch.ones((1, 1), device=device, dtype=input_ids_ext.dtype) * 2
+    input_ids_full = torch.cat([input_ids_ext, placeholder, stop], dim=-1)
+    input_embeds   = vla.get_input_embeddings()(input_ids_full)
+    full_embeds    = torch.cat([patch_embeds, input_embeds], dim=1)
+    vis_mask  = torch.ones((1, NUM_VISION_TOKENS),       device=device, dtype=attn_mask.dtype)
+    ext_mask  = torch.ones((1, input_ids_full.shape[1]), device=device, dtype=attn_mask.dtype)
+    full_mask = torch.cat([vis_mask, ext_mask], dim=1)
+    out = reward_lm(inputs_embeds=full_embeds, attention_mask=full_mask,
+                    use_cache=False, output_hidden_states=True)
+    return out.hidden_states[-1][:, -NUM_ACTION_TOKENS-2:-2].detach()   # (1,56,H)
+
+
+@torch.no_grad()
+def fit_progress_probe(demo_dir, task, encoder, vla, reward_lm, prompt_ids, attn_mask,
+                       max_demos, device, dtype, n_frames_per_demo=8, method='ridge'):
+    """데모 프레임의 pre-action hidden → frame_fraction(0→1) 으로 'task 진전 상관축' w 학습.
+    PCA(최대 분산, unsupervised)와 달리 진전과 상관된 방향을 supervised로 추출.
+      method='ridge' : Ridge 선형회귀 계수 (hidden→progress 예측)
+      method='pls'   : PLS 1st component (분산 대신 progress와의 공분산 최대화 방향)
+    Returns w: (H,) tensor.  reward는 rollout에서 w·pool(h_T) − w·pool(h_0)."""
+    import h5py
+    from torchvision import transforms
+
+    hdf5 = os.path.join(demo_dir, 'demos', 'core_datasets', task,
+                        f'demo_src_{task}_task_D0', 'demo.hdf5')
+    transform = transforms.Compose([
+        transforms.ToPILImage(), transforms.Resize((224, 224)), transforms.ToTensor(),
+    ])
+    X, y = [], []
+    with h5py.File(hdf5, 'r') as f:
+        demos = sorted(f['data'].keys())[:max_demos]
+        for dn in demos:
+            imgs = f[f'data/{dn}/obs/agentview_image']
+            T = len(imgs)
+            idxs = np.linspace(0, T - 1, n_frames_per_demo).astype(int)
+            for i in idxs:
+                img = transform(np.array(imgs[i])).unsqueeze(0)
+                h = goal_pre_action_hidden(img, encoder, vla, reward_lm,
+                                           prompt_ids, attn_mask, device, dtype)  # (1,56,H)
+                X.append(h.mean(dim=1).float().cpu().numpy().flatten())           # pool→(H,)
+                y.append(float(i) / max(T - 1, 1))
+    X = np.stack(X); y = np.array(y)
+    if method == 'pls':
+        from sklearn.cross_decomposition import PLSRegression
+        reg = PLSRegression(n_components=1).fit(X, y)
+        w = reg.coef_.reshape(-1)               # (H,) progress 공분산 방향
+        r2 = reg.score(X, y)
+    else:  # ridge
+        from sklearn.linear_model import Ridge
+        reg = Ridge(alpha=1.0).fit(X, y)
+        w = reg.coef_.reshape(-1)
+        r2 = reg.score(X, y)
+    log.info(f"[progress_probe] method={method}  fit on {len(X)} frames ({len(demos)} demos)  R2={r2:.3f}")
+    return torch.tensor(w, dtype=torch.float32)   # (H,)
+
+
+class ProgressMLP(nn.Module):
+    """pooled pre-action hidden (H,) → progress scalar. time-contrastive(③)용 비선형 scorer."""
+    def __init__(self, in_dim, hidden=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, 1),
+        )
+    def forward(self, x):  # x: (B, H) → (B,)
+        return self.net(x).squeeze(-1)
+
+
+@torch.no_grad()
+def _collect_demo_hidden(demo_dir, task, encoder, vla, reward_lm, prompt_ids, attn_mask,
+                         max_demos, device, dtype, n_frames_per_demo=8):
+    """데모 프레임의 pooled pre-action hidden + (demo_id, frame_fraction) 수집."""
+    import h5py
+    from torchvision import transforms
+    hdf5 = os.path.join(demo_dir, 'demos', 'core_datasets', task,
+                        f'demo_src_{task}_task_D0', 'demo.hdf5')
+    tf = transforms.Compose([transforms.ToPILImage(), transforms.Resize((224, 224)), transforms.ToTensor()])
+    X, frac, dids, G = [], [], [], []
+    with h5py.File(hdf5, 'r') as f:
+        demos = sorted(f['data'].keys())[:max_demos]
+        for di, dn in enumerate(demos):
+            imgs = f[f'data/{dn}/obs/agentview_image']; T = len(imgs)
+            # 데모 goal(마지막 프레임) pooled hidden 1회 계산
+            gimg = tf(np.array(imgs[T - 1])).unsqueeze(0)
+            gh = goal_pre_action_hidden(gimg, encoder, vla, reward_lm, prompt_ids, attn_mask, device, dtype)
+            gh_pooled = gh.mean(dim=1).float().cpu().numpy().flatten()
+            for i in np.linspace(0, T - 1, n_frames_per_demo).astype(int):
+                img = tf(np.array(imgs[i])).unsqueeze(0)
+                h = goal_pre_action_hidden(img, encoder, vla, reward_lm, prompt_ids, attn_mask, device, dtype)
+                X.append(h.mean(dim=1).float().cpu().numpy().flatten())
+                frac.append(float(i) / max(T - 1, 1)); dids.append(di); G.append(gh_pooled)
+    return np.stack(X), np.array(frac), np.array(dids), np.stack(G)
+
+
+def fit_tcn_progress(demo_dir, task, encoder, vla, reward_lm, prompt_ids, attn_mask,
+                     max_demos, device, dtype, n_frames_per_demo=8, steps=800):
+    """time-contrastive(③): 같은 데모 내 '나중 프레임이 더 높은 progress'가 되도록
+    MLP φ를 pairwise ranking loss로 학습. PCA/선형과 달리 비선형 시간구조 인코딩.
+    Returns: frozen ProgressMLP (GPU)."""
+    X, frac, dids, _G = _collect_demo_hidden(demo_dir, task, encoder, vla, reward_lm,
+                                         prompt_ids, attn_mask, max_demos, device, dtype, n_frames_per_demo)
+    Xg = torch.tensor(X, dtype=torch.float32, device=device)
+    fg = torch.tensor(frac, dtype=torch.float32, device=device)
+    dg = torch.tensor(dids, device=device)
+    mlp = ProgressMLP(Xg.shape[1]).to(device)
+    opt = torch.optim.Adam(mlp.parameters(), lr=1e-3)
+    N = Xg.shape[0]
+    for step in range(steps):
+        ia = torch.randint(0, N, (256,), device=device); ib = torch.randint(0, N, (256,), device=device)
+        same = (dg[ia] == dg[ib]) & (fg[ia] != fg[ib])    # 같은 데모, 다른 시점
+        if same.sum() < 4:
+            continue
+        ia, ib = ia[same], ib[same]
+        sa, sb = mlp(Xg[ia]), mlp(Xg[ib])
+        later = (fg[ib] > fg[ia]).float()                 # ib가 더 나중이면 1
+        # 나중 프레임 score가 더 크도록: margin ranking
+        loss = F.softplus(-(sb - sa) * (2 * later - 1)).mean()
+        opt.zero_grad(); loss.backward(); opt.step()
+    mlp.eval()
+    for p in mlp.parameters():
+        p.requires_grad_(False)
+    # 단조성 점검: progress와 frac의 상관
+    with torch.no_grad():
+        pred = mlp(Xg).cpu().numpy()
+    corr = float(np.corrcoef(pred, frac)[0, 1])
+    log.info(f"[tcn_progress] fit on {N} frames  final_loss={loss.item():.3f}  corr(pred,frac)={corr:.3f}")
+    return mlp
+
+
+class GoalDistMLP(nn.Module):
+    """pooled pre-action hidden (H,) → d차원 임베딩 φ. contrastive RL / goal-distance(④)용.
+    ||φ(h) − φ(goal)|| 가 goal까지 '남은 진전'을 근사하도록 학습."""
+    def __init__(self, in_dim, emb=64, hidden=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, emb),
+        )
+    def forward(self, x):           # x: (B, H) → (B, emb)
+        return self.net(x)
+
+
+def fit_goaldist(demo_dir, task, encoder, vla, reward_lm, prompt_ids, attn_mask,
+                 max_demos, device, dtype, n_frames_per_demo=8, steps=1200):
+    """contrastive goal-distance(④): 임베딩 φ를 학습하여 ||φ(h)−φ(goal)|| ≈ (1−frac)
+    (goal까지 남은 진전)이 되도록. quasimetric/goal-conditioned value의 단순화.
+    rollout score_t = −||φ(h_t)−φ(goal)|| → goal에 가까울수록 ↑.
+    Returns: frozen GoalDistMLP (GPU)."""
+    X, frac, dids, G = _collect_demo_hidden(demo_dir, task, encoder, vla, reward_lm,
+                                            prompt_ids, attn_mask, max_demos, device, dtype, n_frames_per_demo)
+    Xg = torch.tensor(X, dtype=torch.float32, device=device)
+    Gg = torch.tensor(G, dtype=torch.float32, device=device)
+    fg = torch.tensor(frac, dtype=torch.float32, device=device)
+    remain = (1.0 - fg)                                   # goal까지 남은 진전 (0=goal)
+    mlp = GoalDistMLP(Xg.shape[1]).to(device)
+    opt = torch.optim.Adam(mlp.parameters(), lr=1e-3)
+    N = Xg.shape[0]
+    for step in range(steps):
+        idx = torch.randint(0, N, (256,), device=device)
+        d = (mlp(Xg[idx]) - mlp(Gg[idx])).norm(dim=-1)    # ||φ(h)−φ(goal)||
+        loss = F.mse_loss(d, remain[idx])
+        opt.zero_grad(); loss.backward(); opt.step()
+    mlp.eval()
+    for p in mlp.parameters():
+        p.requires_grad_(False)
+    # 단조성 점검: −거리(=score)와 frac의 상관 (1에 가까울수록 진전과 상관)
+    with torch.no_grad():
+        score = -(mlp(Xg) - mlp(Gg)).norm(dim=-1).cpu().numpy()
+    corr = float(np.corrcoef(score, frac)[0, 1])
+    log.info(f"[goaldist] fit on {N} frames  final_loss={loss.item():.3f}  corr(score,frac)={corr:.3f}")
+    return mlp
+
+
 def _vla_forward_patch_embeds(
     patch_embeds: torch.Tensor,
     prompt_ids: torch.Tensor,
@@ -98,8 +279,17 @@ def _vla_forward_patch_embeds(
     device: torch.device,
     dtype: torch.dtype,
     temperature: float,
+    goal_hidden=None,   # (1,56,H) EMA reward LLM의 goal-이미지 pre-action hidden (cosine metric)
+    probe_w=None,       # (H,) progress probe 방향 (probe/pls metric): s_t = w·pool(h_t)
+    progress_mlp=None,  # ProgressMLP (tcn metric): s_t = mlp(pool(h_t))
+    goaldist_mlp=None,  # GoalDistMLP φ (goaldist metric): s_t = −||φ(pool(h_t))−φ(pool(goal))||
 ):
-    """patch_embeds (1, 256, 4096) + prompt → (tids (1,56), logprob float)"""
+    """patch_embeds (1, 256, 4096) + prompt → (tids (1,56), logprob float, score or None)
+
+    metric에 따라 per-chunk scalar 반환 (swm_rollout이 cos_T−cos_0 progress로 변환):
+      - goal_hidden: cosine(h_t, h_goal)               (goal-conditioned)
+      - probe_w:     w·pool(h_t)                        (진전 상관축 투영)
+    """
     input_ids_ext = prompt_ids.clone()
     placeholder   = torch.ones((1, NUM_ACTION_TOKENS), device=device, dtype=input_ids_ext.dtype)
     stop          = torch.ones((1, 1),                  device=device, dtype=input_ids_ext.dtype) * 2
@@ -112,14 +302,37 @@ def _vla_forward_patch_embeds(
     ext_mask  = torch.ones((1, input_ids_full.shape[1]),  device=device, dtype=attn_mask.dtype)
     full_mask = torch.cat([vis_mask, ext_mask], dim=1)
 
-    out    = vla.language_model(inputs_embeds=full_embeds, attention_mask=full_mask, use_cache=False)
+    need_hidden = (goal_hidden is not None) or (probe_w is not None) or (progress_mlp is not None) or (goaldist_mlp is not None)
+    out    = vla.language_model(inputs_embeds=full_embeds, attention_mask=full_mask,
+                                use_cache=False, output_hidden_states=need_hidden)
     logits = out.logits[:, -NUM_ACTION_TOKENS-2:-2]  # (1, 56, V)  off-by-one fix
     if temperature != 1.0:
         logits = logits / temperature
     dist = Categorical(logits=logits.reshape(-1, logits.size(-1)).float())
     tids = dist.sample().reshape(1, -1)
     lp   = dist.log_prob(tids.reshape(-1)).sum().item()
-    return tids, lp
+
+    score = None
+    if need_hidden:
+        # 정책 LLM의 action head 직전 hidden (action 토큰 위치, logits와 동일 slice)
+        h_pol = out.hidden_states[-1][:, -NUM_ACTION_TOKENS-2:-2]              # (1, 56, H)
+        pooled = h_pol.float().mean(dim=1).squeeze(0)                          # (H,)
+        if goaldist_mlp is not None and goal_hidden is not None:
+            # contrastive goal-distance: score = −||φ(pool(h_t)) − φ(pool(goal))||
+            g_pooled = goal_hidden.to(pooled.device).float().mean(dim=1).squeeze(0)   # (H,)
+            d = (goaldist_mlp(pooled.unsqueeze(0)) - goaldist_mlp(g_pooled.unsqueeze(0))).norm(dim=-1)
+            score = float(-d.squeeze())
+        elif progress_mlp is not None:
+            # time-contrastive 비선형 progress
+            score = float(progress_mlp(pooled.unsqueeze(0)).squeeze())
+        elif probe_w is not None:
+            # progress 상관축 투영: w · pool(h_t)
+            score = float(torch.dot(pooled, probe_w.to(pooled.device).float()))
+        else:
+            score = F.cosine_similarity(
+                h_pol.float(), goal_hidden.to(h_pol.device).float(), dim=-1
+            ).mean().item()
+    return tids, lp, score
 
 
 def swm_rollout(
@@ -139,6 +352,10 @@ def swm_rollout(
     dtype: torch.dtype,
     patch_weights: torch.Tensor = None,  # (256,) CPU — spatial weighted mean pool
     wm_bridge=None,   # NEW: nn.Linear(spatial_dim, 2176), spatial WM 전용
+    goal_hidden=None, # (1,56,H) EMA reward LLM의 goal-이미지 pre-action hidden (cosine)
+    probe_w=None,     # (H,) progress probe 방향 (probe/pls metric)
+    progress_mlp=None,# ProgressMLP (tcn metric)
+    goaldist_mlp=None,# GoalDistMLP φ (goaldist metric)
 ):
     """
     수정된 SWM rollout (circulatory 구조):
@@ -165,15 +382,20 @@ def swm_rollout(
     logprobs_list    = []
     z_history        = []
     z_at_chunk_start = []  # 각 chunk 시작 z (gradient recompute용 CPU 저장)
+    ema_cos_list     = []  # chunk별 pre-action hidden consistency (EMA reward용)
 
     for chunk_i in range(n_chunks):
         z_at_chunk_start.append(z.clone().cpu())
 
         # ── VLA: 현재 patch_embeds로 action 생성 ──────────────────────────
         with torch.no_grad():
-            tids, lp = _vla_forward_patch_embeds(
-                patch_embeds, prompt_ids, attn_mask, vla, device, dtype, temperature
+            tids, lp, ema_cos = _vla_forward_patch_embeds(
+                patch_embeds, prompt_ids, attn_mask, vla, device, dtype, temperature,
+                goal_hidden=goal_hidden, probe_w=probe_w, progress_mlp=progress_mlp,
+                goaldist_mlp=goaldist_mlp,
             )
+        if ema_cos is not None:
+            ema_cos_list.append(ema_cos)
 
         token_ids_list.append(tids[0].cpu())
         logprobs_list.append(lp)
@@ -215,7 +437,16 @@ def swm_rollout(
         # is_spatial, dim≠2176, no bridge: keep same patch_embeds (backward compat)
 
     rollout_data = (z_at_chunk_start, init_patch_embeds_cpu)
-    return token_ids_list, logprobs_list, rollout_data, z_history
+    # goal-conditioned reward: VLA hidden cosine은 ≈1로 포화 →
+    #   (1−cos_0) 분모 정규화는 분모≈0으로 폭발 → raw delta(cos_T − cos_0)만 사용.
+    #   cos_0 = chunk0(초기 관측) vs h_goal,  cos_T = 마지막 chunk(상상 관측) vs h_goal
+    #   진전(goal에 가까워짐) > 0, 멀어짐 < 0. 그룹 내 상대 advantage라 스케일은 무관.
+    ema_consistency = None
+    if ema_cos_list:
+        cos_0 = ema_cos_list[0]
+        cos_T = ema_cos_list[-1]
+        ema_consistency = float(cos_T - cos_0)
+    return token_ids_list, logprobs_list, rollout_data, z_history, ema_consistency
 
 
 def _patch_embeds_from_z(z_cpu, vla, wm_bridge, device, dtype):
@@ -779,6 +1010,7 @@ def load_initial_states(demo_dir, task, encoder, max_demos, device, dtype,
     init_images  = []
     init_latents = []
     init_goals   = []
+    init_goal_images = []   # 데모 마지막 프레임(goal) 이미지 — EMA reward LLM 입력용
 
     with h5py.File(hdf5, 'r') as f:
         demos = sorted(f['data'].keys())[:max_demos]
@@ -786,6 +1018,9 @@ def load_initial_states(demo_dir, task, encoder, max_demos, device, dtype,
             img_np    = f[f'data/{dn}/obs/agentview_image'][0]
             image_t   = transform(img_np).unsqueeze(0)
             image_gpu = image_t.to(device)
+            # goal 이미지 = 데모 마지막 프레임
+            goal_img_np = f[f'data/{dn}/obs/agentview_image'][-1]
+            init_goal_images.append(transform(goal_img_np).unsqueeze(0).cpu())
             if hasattr(encoder, 'spatial_proj') and getattr(encoder, 'spatial_dim', None) is not None and token_weights is None:
                 z = encoder.encode_spatial_projected(image_gpu).to(dtype)  # (1, 256, d_s)
             elif token_weights is not None:
@@ -905,7 +1140,7 @@ def load_initial_states(demo_dir, task, encoder, max_demos, device, dtype,
                 init_goals.append(torch.from_numpy(pos))
 
     log.info(f"[init_states] {task}: {len(init_latents)} demos encoded  reward_type={reward_type}")
-    return init_images, init_latents, init_goals
+    return init_images, init_latents, init_goals, init_goal_images
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1163,7 +1398,7 @@ def main():
         log.info(f"Pre-encoding initial states ...  reward_type={reward_type}")
     # transition_l2: rollout_steps = n_rollout_chunks × NUM_ACTIONS_CHUNK
     rollout_steps = cfg.training.n_rollout_chunks * NUM_ACTIONS_CHUNK
-    init_images, init_latents, init_goals = load_initial_states(
+    init_images, init_latents, init_goals, init_goal_images = load_initial_states(
         cfg.data_root, task, encoder, cfg.training.max_demos, device, dtype,
         reward_type=reward_type,
         transition=transition,
@@ -1217,6 +1452,49 @@ def main():
         optimizer, T_max=cfg.training.iterations, eta_min=cfg.training.lr * 0.1
     )
 
+    # ── EMA reward LLM (느린 target = EMA(action LLM)) ─────────────────────────
+    #   변형1 (mode=only):     reward = pre-action hidden cosine(policy, EMA)  [grounding 없음]
+    #   변형2 (mode=additive): reward = WM grounding + beta * 위 cosine
+    import copy as _copy
+    ema_cfg        = cfg.get('ema_reward', {}) or {}
+    use_ema_reward = bool(ema_cfg.get('enable', False))
+    ema_mode       = ema_cfg.get('mode', 'additive')      # 'only' | 'additive'
+    ema_metric     = ema_cfg.get('metric', 'cosine')      # 'cosine'(goal hidden) | 'probe'(progress 상관축)
+    ema_tau        = float(ema_cfg.get('tau', 0.99))
+    ema_beta       = float(ema_cfg.get('beta', 1.0))
+    ema_lm         = None
+    probe_w        = None
+    progress_mlp   = None
+    goaldist_mlp   = None
+    if use_ema_reward:
+        ema_lm = _copy.deepcopy(vla_raw.language_model).eval()
+        for p in ema_lm.parameters():
+            p.requires_grad_(False)
+        if is_main():
+            log.info(f"[EMA reward] enabled  mode={ema_mode}  metric={ema_metric}  tau={ema_tau}  beta={ema_beta}")
+        if ema_metric in ('probe', 'pls'):
+            # 진전 상관축 w 를 데모 hidden→frame_fraction 으로 1회 fit (EMA LLM 사용)
+            #   metric=probe → Ridge,  metric=pls → PLS(공분산 최대화)
+            probe_w = fit_progress_probe(
+                cfg.data_root, task, encoder, vla_raw, ema_lm, p_ids, a_mask,
+                cfg.training.max_demos, device, dtype,
+                method=('pls' if ema_metric == 'pls' else 'ridge'),
+            )
+        elif ema_metric == 'tcn':
+            # time-contrastive: 비선형 progress MLP (시간 ranking)
+            progress_mlp = fit_tcn_progress(
+                cfg.data_root, task, encoder, vla_raw, ema_lm, p_ids, a_mask,
+                cfg.training.max_demos, device, dtype,
+            )
+        elif ema_metric == 'goaldist':
+            # contrastive goal-distance: 임베딩 φ (goal까지 거리=남은 진전)
+            goaldist_mlp = fit_goaldist(
+                cfg.data_root, task, encoder, vla_raw, ema_lm, p_ids, a_mask,
+                cfg.training.max_demos, device, dtype,
+            )
+    else:
+        ema_mode = None   # 비활성: 기존 grounding reward 그대로
+
     # ── Resume ────────────────────────────────────────────────────────────────
     start_iter  = 1
     best_reward = -float('inf')
@@ -1265,11 +1543,21 @@ def main():
             image0 = init_images[z0_idx].to(device)            # 관측 이미지 (VLA spatial용)
             goal   = init_goals[z0_idx]
 
+            # ── EMA reward: metric=cosine이면 goal 이미지 → reward LLM → h_goal ──
+            #               metric=probe이면 probe_w(고정) 사용, goal_hidden 불필요
+            goal_hidden = None
+            if use_ema_reward and ema_metric in ('cosine', 'goaldist'):
+                # cosine: h_goal과 직접 cosine / goaldist: φ(h_t)와 φ(h_goal) 거리
+                goal_hidden = goal_pre_action_hidden(
+                    init_goal_images[z0_idx], encoder, vla_raw, ema_lm,
+                    p_ids, a_mask, device, dtype,
+                )
+
             group_rewards = []
             group_data    = []   # (tids_ep, lp_ep, rollout_data) 저장
 
             for _ in range(cfg.training.g_rollouts):
-                tids_ep, lp_ep, rollout_data, z_hist = swm_rollout(
+                tids_ep, lp_ep, rollout_data, z_hist, ema_cons = swm_rollout(
                     z0, image0, encoder, transition, heads,
                     vla_raw, processor, p_ids, a_mask,
                     tokens_to_actions,
@@ -1278,7 +1566,17 @@ def main():
                     device, dtype,
                     patch_weights=patch_weights,
                     wm_bridge=wm_bridge,
+                    goal_hidden=goal_hidden,
+                    probe_w=probe_w,
+                    progress_mlp=progress_mlp,
+                    goaldist_mlp=goaldist_mlp,
                 )
+                if ema_mode == 'only':
+                    # 변형1: grounding 없이 EMA consistency가 메인 reward
+                    rew = ema_cons if ema_cons is not None else 0.0
+                    group_rewards.append(float(rew))
+                    group_data.append((tids_ep, lp_ep, rollout_data))
+                    continue
                 if reward_type == 'transition_l2':
                     rew = transition_l2_reward(z_hist, goal, device)
                 elif reward_type == 'latent':
@@ -1300,6 +1598,9 @@ def main():
                     rew = reward_model_reward(z_hist, goal, rm, device)
                 else:
                     rew = graph_reward(z_hist, heads, goal, device)
+                # 변형2: 기존 grounding reward + β·EMA consistency
+                if ema_mode == 'additive' and ema_cons is not None:
+                    rew = float(rew) + ema_beta * float(ema_cons)
                 group_rewards.append(rew)
                 group_data.append((tids_ep, lp_ep, rollout_data))
 
@@ -1339,6 +1640,12 @@ def main():
         optimizer.step()
         scheduler.step()
 
+        # ── EMA(reward) 업데이트: θ_ema ← τ·θ_ema + (1-τ)·θ_policy ──────────────
+        if use_ema_reward:
+            with torch.no_grad():
+                for pe, p in zip(ema_lm.parameters(), vla_raw.language_model.parameters()):
+                    pe.mul_(ema_tau).add_(p.detach().to(pe.dtype), alpha=1.0 - ema_tau)
+
         mean_r = np.mean(iter_rewards) if iter_rewards else 0.0
         std_r  = np.std(iter_rewards)  if iter_rewards else 0.0
         min_r  = np.min(iter_rewards)  if iter_rewards else 0.0
@@ -1365,7 +1672,11 @@ def main():
                            'nonzero_frac': nonzero_frac,
                            'loss': mean_loss, 'iteration': iteration})
 
-        if not args.probe and is_main() and iteration % cfg.training.save_every == 0:
+        # 저장: save_every 미사용 — 매 iteration last.pt 갱신, 개선 시 best.pt만 (디스크 절약)
+        #   last.pt : 전체 state(+optimizer) — resume 용
+        #   best.pt : 학습된(requires_grad) 파라미터만 — export 는 strict=False 로 base 에 병합
+        #             (q/v_proj only 학습 시 19G → ~2G. full_finetune 시는 전체 저장됨)
+        if not args.probe and is_main():
             ckpt = {
                 'iteration': iteration,
                 'vla': vla_raw.state_dict(),
@@ -1375,12 +1686,16 @@ def main():
             }
             if wm_bridge is not None:
                 ckpt['wm_bridge'] = wm_bridge.state_dict()
-            torch.save(ckpt, out_dir / f'ckpt_iter{iteration:04d}.pt')
             torch.save(ckpt, out_dir / 'last.pt')
             if mean_r > best_reward:
                 best_reward = mean_r
-                torch.save(ckpt, out_dir / 'best.pt')
-                log.info(f"  ★ New best reward={best_reward:.4f}")
+                tnames = {n for n, p in vla_raw.named_parameters() if p.requires_grad}
+                slim_vla = {k: v for k, v in vla_raw.state_dict().items() if k in tnames}
+                best_ckpt = {'iteration': iteration, 'vla': slim_vla, 'reward_mean': mean_r}
+                if wm_bridge is not None:
+                    best_ckpt['wm_bridge'] = wm_bridge.state_dict()
+                torch.save(best_ckpt, out_dir / 'best.pt')
+                log.info(f"  ★ New best reward={best_reward:.4f}  (slim ckpt: {len(slim_vla)} tensors)")
 
     if is_main() and args.probe:
         arr = np.array(probe_rewards_all)

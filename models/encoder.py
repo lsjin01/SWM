@@ -48,7 +48,7 @@ class DINOSigLIPEncoder(nn.Module):
     def _load_from_vla(self, vla_path: str, freeze: bool):
         """OpenVLA에서 vision backbone만 추출."""
         import sys
-        sys.path.insert(0, '/NHNHOME/WORKSPACE/0526040052_A/sjLee/WMPO-JEPA/dependencies/openvla-oft')
+        sys.path.insert(0, '/home/mipstu/jiPark/openvla-oft/experiments/robot')
         from transformers import AutoModelForVision2Seq
 
         print(f"[DINOSigLIPEncoder] Loading vision backbone from {vla_path} ...")

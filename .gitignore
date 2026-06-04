@@ -8,3 +8,10 @@ __pycache__/
 *.pt
 *.safetensors
 .env
+
+# 대용량 데이터/체크포인트 (커밋 금지)
+ckpts/
+data/
+*.pkl
+hf_token
+GROUP-B_key

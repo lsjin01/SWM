@@ -1,0 +1,38 @@
+experiment:
+  name: swm_stage3_full_probe_add
+  seed: 42
+  output_dir: outputs/stage3/full_probe_add/square
+task: square
+unnorm_key: square_d0_300_demos
+reward_type: latent
+reward_metric: pca_cosine
+pca_components: 16
+n_goals: 4
+phase_threshold: 0.3
+reward_aggregation: mean
+vla_path: /home/miplab1/sjLee/swm/ckpts/SFT_models/square/checkpoint_files/SFT_models/square
+swm_ckpt: /home/miplab1/sjLee/swm/ckpts/transition_stage2_best.pt
+stage1_ckpt: /home/miplab1/sjLee/swm/outputs/stage1/verify/best.pt
+data_root: /home/miplab1/sjLee/swm/data/train_root
+ema_reward:
+  enable: true
+  mode: additive
+  metric: probe
+  tau: 0.99
+  beta: 0.3
+training:
+  iterations: 100
+  max_demos: 300
+  n_states_per_iter: 8
+  g_rollouts: 8
+  mini_g: 2
+  n_rollout_chunks: 20
+  temperature: 1.6
+  full_finetune: false
+  freeze_projector: true
+  lr: 5.0e-6
+  clip_eps: 0.2
+  kl_coef: 0.05
+  grad_clip: 1.0
+  log_every: 1
+  save_every: 999999
