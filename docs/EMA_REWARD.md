@@ -187,10 +187,14 @@ else (goal_hidden)         → cosine
 | **full_probe_add** | additive | probe | **0.242** | grounding+probe |
 | full_pls_only | only | pls | 0.188 | train reward는 높았으나 SR 낮음 |
 | full_pls_add | additive | pls | 0.180 | |
-| full_tcn_only | only | tcn | (체인 진행 중) | |
+| full_tcn_only | only | tcn | (체인 진행 중, iter~31) | reward 1.48 / std 0.087 건강 |
 | full_goaldist_only | only | goaldist | (대기) | |
 | full_tcn_add | additive | tcn | (대기) | |
 | full_goaldist_add | additive | goaldist | (대기) | |
+| full_byol | additive | cosine + **BYOL aux** | (대기) | §10 — backprop consistency |
+
+> ③④+byol 체인은 `scripts/run_chain.sh` 로 순차 실행. 결과는 `eval_results/chain_results.csv` 누적.
+> (참고: probe_add 는 디스크full 로 1차 eval FAILED → 복구 재실행해 0.242 기록. 운영 사고는 §8.5.)
 
 baseline(검증 완료): SFT 0.234~0.266 / P_128 0.18~0.20 / **P_1280 0.398**.
 → 현재까지 **probe 계열(only 0.250 / add 0.242)** 이 우세, pls 계열은 약함.
@@ -321,3 +325,43 @@ conda run -n wmpo python scripts/train_stage3.py --config configs/stage3_<varian
 - 환경 셋업: `setup_wmpo_full.sh` (torch 2.8.0+cu128, transformers moojink fork, mujoco-py 2.1.2.14 등).
 - stage1/2 ckpt: `outputs/stage1/verify/best.pt`, `ckpts/transition_stage2_best.pt`.
 - data_root: `data/train_root` (256px WMPO 데이터).
+
+---
+
+## 10. BYOL식 보조 consistency loss (실험적)
+
+지금까지의 metric(probe/pls/tcn/goaldist)은 모두 **RL식**이다: EMA goal과의 비교를 **detach된 스칼라 reward**로 만들고, 정책은 GRPO(정책경사)로만 학습한다 — gradient 가 hidden 비교를 통과하지 않는다(§7.2).
+
+BYOL/DINO 처럼 **gradient 가 hidden 비교를 직접 통과**해 정책 hidden 을 goal 로 끌어당기는 항을 추가로 실험한다.
+
+### 10.1 무엇을 하나
+- rollout **마지막 chunk** 의 pre-action hidden `h_T`(grad O) 를 EMA goal hidden(detach) 로 끌어당김:
+  ```
+  L_byol = 1 − cosine( pool(h_T),  stopgrad(pool(h_goal)) )
+  L_total = L_GRPO + β_byol · L_byol      # 가산
+  ```
+- "상상 rollout 의 끝 표현이 goal 표현을 닮도록" backprop. BYOL 의 stop-grad(=goal detach) 동일.
+- RL reward 와 **공존**: GRPO 가 행동을, BYOL 항이 표현을 동시에 민다.
+
+### 10.2 RL식 reward 와의 차이 (§7.2 의 구체화)
+| | RL reward (probe/…/goaldist) | BYOL aux |
+|---|---|---|
+| 비교 결과 | detach 스칼라(점수) | 미분되는 loss |
+| gradient 경로 | action logprob 만 (`−adv·∇logπ`) | hidden 비교 통과 (`∇‖·‖`) |
+| 정책이 배우는 것 | 행동(점수 높은 action 강화) | 표현(hidden 을 goal 로 정렬) |
+
+### 10.3 코드 / config
+- `recompute_logprobs_grad(..., goal_hidden=)` : grad ON forward 의 **마지막 chunk** hidden 추출 → `(lp_list, byol_aux)` 반환.
+- main: `L = L_GRPO + byol_beta · byol_aux` ([train_stage3.py 백워드 블록]). `byol_aux` 값은 iter 로그에 `byol_aux=` 로 출력.
+- config (`configs/stage3_full_byol.yaml`):
+  ```yaml
+  ema_reward: { enable: true, mode: additive, metric: cosine, tau: 0.99, beta: 0.3 }
+  byol_aux:   { enable: true, beta: 5.0 }   # L_total = L_GRPO + 5.0·(1−cos(h_T,goal))
+  ```
+- 다른 변형(use_byol 미설정)은 `byol_aux=0` 이라 기존과 동일 동작 — 영향 없음.
+
+### 10.4 주의
+- pre-action hidden cosine 은 ≈1 로 포화(§6.3) → `(1−cos)` 가 작아 gradient 가 약할 수 있음.
+  AdamW 가 크기를 정규화해 방향은 살지만, 효과 약하면 **β_byol↑ 또는 raw MSE 로 교체** 필요.
+- 효과는 `byol_aux` 로그가 학습 중 **감소하는지**로 확인. eval SR 로 최종 판정.
+- target 은 현재 **마지막 chunk** 만. 진전 가중(`progress-weighted`) 으로 확장 가능.

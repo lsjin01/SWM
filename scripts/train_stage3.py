@@ -475,11 +475,17 @@ def recompute_logprobs_grad(
     device: torch.device,
     dtype: torch.dtype,
     wm_bridge=None,           # nn.Linear(spatial_dim, 2176) — circulatory 구조용
+    goal_hidden=None,         # (1,56,H) BYOL aux용 EMA goal hidden. None이면 aux=0
 ):
     """
     gradient 있는 log-prob 재계산 (GRPO backward용).
     circulatory: chunk마다 z_t → wm_bridge → vla.projector → 개별 LLM forward.
     legacy fallback: 단일 patch_embeds로 한 번만 LLM forward.
+
+    Returns: (lp_list, byol_aux)
+      byol_aux: goal_hidden 주어지면 '마지막 chunk pre-action hidden'을 goal로 끌어당기는
+                consistency loss (1 − cosine). BYOL식: gradient가 정책 hidden을 직접 당김.
+                goal_hidden=None이면 0 (스칼라 텐서).
     """
     # ── circulatory mode ─────────────────────────────────────────────────────
     if isinstance(rollout_data, tuple):
@@ -500,6 +506,8 @@ def recompute_logprobs_grad(
             z_at_chunk_cpu[0].shape[-1] == 2176
         )
         lp_list = []
+        byol_aux = torch.zeros((), device=device)
+        last_i = len(token_ids_list) - 1
         for i, tids in enumerate(token_ids_list):
             if i == 0:
                 patch_embeds = init_patch_embeds_cpu.to(device, dtype)
@@ -509,15 +517,23 @@ def recompute_logprobs_grad(
             else:
                 patch_embeds = init_patch_embeds_cpu.to(device, dtype)
             full_embeds = torch.cat([patch_embeds, input_embeds], dim=1)
+            want_h = (goal_hidden is not None) and (i == last_i)   # 마지막 chunk만 hidden 필요
             out    = vla.language_model(inputs_embeds=full_embeds,
-                                        attention_mask=full_mask, use_cache=False)
+                                        attention_mask=full_mask, use_cache=False,
+                                        output_hidden_states=want_h)
             logits = out.logits[:, -NUM_ACTION_TOKENS-2:-2]
             lp = -F.cross_entropy(
                 logits.reshape(-1, logits.size(-1)).float(),
                 tids.to(device).reshape(-1), reduction='sum',
             )
             lp_list.append(lp)
-        return lp_list
+            if want_h:
+                # BYOL aux: 마지막 chunk pre-action hidden(grad O) → goal(detach)로 끌어당김
+                h_last = out.hidden_states[-1][:, -NUM_ACTION_TOKENS-2:-2]    # (1,56,H) grad
+                hp = h_last.float().mean(dim=1)                               # (1,H)
+                gp = goal_hidden.to(device).float().mean(dim=1).detach()      # (1,H) stop-grad
+                byol_aux = 1.0 - F.cosine_similarity(hp, gp, dim=-1).mean()
+        return lp_list, byol_aux
 
     # ── legacy mode (단일 patch_embeds) ──────────────────────────────────────
     patch_embeds = rollout_data.to(device, dtype)
@@ -539,7 +555,7 @@ def recompute_logprobs_grad(
             tids.to(device).reshape(-1), reduction='sum',
         )
         lp_list.append(lp)
-    return lp_list
+    return lp_list, torch.zeros((), device=device)   # legacy: BYOL aux 미지원
 
 
 def grpo_loss_fn(lp_new_list, lp_old_list, advantages, clip_eps, kl_coef):
@@ -1462,6 +1478,10 @@ def main():
     ema_metric     = ema_cfg.get('metric', 'cosine')      # 'cosine'(goal hidden) | 'probe'(progress 상관축)
     ema_tau        = float(ema_cfg.get('tau', 0.99))
     ema_beta       = float(ema_cfg.get('beta', 1.0))
+    # BYOL식 보조 consistency loss: 정책 마지막-chunk hidden을 goal(EMA)로 backprop으로 끌어당김
+    byol_cfg       = cfg.get('byol_aux', {}) or {}
+    use_byol       = bool(byol_cfg.get('enable', False))
+    byol_beta      = float(byol_cfg.get('beta', 5.0))
     ema_lm         = None
     probe_w        = None
     progress_mlp   = None
@@ -1472,6 +1492,8 @@ def main():
             p.requires_grad_(False)
         if is_main():
             log.info(f"[EMA reward] enabled  mode={ema_mode}  metric={ema_metric}  tau={ema_tau}  beta={ema_beta}")
+            if use_byol:
+                log.info(f"[BYOL aux] enabled  beta={byol_beta}  (정책 last-chunk hidden → goal consistency backprop)")
         if ema_metric in ('probe', 'pls'):
             # 진전 상관축 w 를 데모 hidden→frame_fraction 으로 1회 fit (EMA LLM 사용)
             #   metric=probe → Ridge,  metric=pls → PLS(공분산 최대화)
@@ -1536,6 +1558,8 @@ def main():
         )
         iter_rewards = []
         iter_loss_sum = 0.0
+        iter_byol_sum = 0.0
+        iter_byol_cnt = 0
         optimizer.zero_grad()
 
         for z0_idx in z0_batch:
@@ -1546,8 +1570,8 @@ def main():
             # ── EMA reward: metric=cosine이면 goal 이미지 → reward LLM → h_goal ──
             #               metric=probe이면 probe_w(고정) 사용, goal_hidden 불필요
             goal_hidden = None
-            if use_ema_reward and ema_metric in ('cosine', 'goaldist'):
-                # cosine: h_goal과 직접 cosine / goaldist: φ(h_t)와 φ(h_goal) 거리
+            if use_ema_reward and (ema_metric in ('cosine', 'goaldist') or use_byol):
+                # cosine: h_goal과 직접 cosine / goaldist: φ거리 / byol: backprop consistency
                 goal_hidden = goal_pre_action_hidden(
                     init_goal_images[z0_idx], encoder, vla_raw, ema_lm,
                     p_ids, a_mask, device, dtype,
@@ -1620,9 +1644,10 @@ def main():
                     tids_ep, lp_ep, rollout_data = group_data[g_idx]
                     adv_scalar = float(adv_z[g_idx])
 
-                    lp_new_list = recompute_logprobs_grad(
+                    lp_new_list, byol_aux = recompute_logprobs_grad(
                         rollout_data, tids_ep, vla_raw, p_ids, a_mask, device, dtype,
                         wm_bridge=wm_bridge,
+                        goal_hidden=(goal_hidden if use_byol else None),
                     )
                     lp_old_list = lp_ep
                     adv_list    = [adv_scalar] * len(lp_new_list)
@@ -1632,6 +1657,11 @@ def main():
                         cfg.training.clip_eps,
                         cfg.training.kl_coef,
                     )
+                    if use_byol:
+                        # BYOL식: 정책 hidden을 goal로 직접 끌어당기는 backprop 항 (GRPO와 가산)
+                        loss = loss + byol_beta * byol_aux
+                        iter_byol_sum += float(byol_aux.detach())
+                        iter_byol_cnt += 1
                     (loss / (n_mb * len(z0_batch))).backward()
                     iter_loss_sum += loss.item()
                     torch.cuda.empty_cache()
@@ -1659,11 +1689,13 @@ def main():
 
         n_grads = len(z0_batch) * cfg.training.g_rollouts
         mean_loss = iter_loss_sum / max(n_grads, 1)
+        byol_str = (f"  byol_aux={iter_byol_sum/max(iter_byol_cnt,1):.4f}"
+                    if use_byol and iter_byol_cnt else "")
         if is_main() and iteration % cfg.training.log_every == 0:
             log.info(
                 f"[Iter {iteration:04d}]  reward={mean_r:.4f}  std={std_r:.4f}  "
                 f"[{min_r:.3f},{max_r:.3f}]  nonzero={nonzero_frac:.2f}  "
-                f"loss={mean_loss:.4f}  lr={scheduler.get_last_lr()[0]:.2e}"
+                f"loss={mean_loss:.4f}  lr={scheduler.get_last_lr()[0]:.2e}{byol_str}"
             )
             if use_wandb:
                 import wandb
