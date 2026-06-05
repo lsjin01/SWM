@@ -198,6 +198,24 @@ else (goal_hidden)         → cosine
 
 baseline(검증 완료): SFT 0.234~0.266 / P_128 0.18~0.20 / **P_1280 0.398**.
 → 현재까지 **probe 계열(only 0.250 / add 0.242)** 이 우세, pls 계열은 약함.
+
+#### 6.2.1 baseline 재평가 (동일 코드, 결정론성 확인 — 2026-06-04)
+> 이전 baseline 은 package 를 건드린 상태들이라 조건이 섞여 있었음 → 현재 코드로 일괄 재측정.
+
+| 모델 | 재평가 SR | 비고 |
+|------|----------:|------|
+| SFT | **0.266** | r1=r2=0.266 (완전 동일) |
+| P_128 | **0.203** | |
+| P_1280 | **0.398** | 논문 재현 정상 → 프로토콜 정상 |
+
+**핵심 발견**:
+- **eval 은 결정론적**: validation 은 `do_sample=False`(greedy, ray_trainer.py:393) → `temperature=1.6` 은 **train rollout 전용**, eval 에선 무시. env scene 도 `seed_101` 고정(rob_rollout.py:191) → **재실행해도 동일값**. (SFT 2회 모두 0.266 으로 확인)
+- 따라서 **단순 재실행으로 분산(CI) 못 얻음.** SFT(0.266) vs P_128(0.203) 차이 0.063 은 n=128 binomial CI(±0.075) 보다 작아 **유의성 미확정**.
+- "P_128 < SFT" 는 버그가 아니라 이 128-scene 의 실제 측정값. 논문에서 P_128 > SFT 라면 다른/더 많은 scene 으로 평가했기 때문일 가능성.
+- → 유의성 판정엔 **scene seed 다양화**(seed_101 인자화, 여러 seed 평균) 필요. `scripts/reeval_multiseed.sh` 로 다중 평가 인프라 구축.
+
+#### 6.2.2 reward grounding 진단 (`scripts/diag_reward_grounding.py`)
+상상(WM) reward 가 실제 env 성공과 상관되는지 점검: 같은 초기상태에서 ①상상 rollout reward + action ②실제 env replay 성공 → 상관 분석. 상관≈0 이면 reward 가 ungrounded(환각 최적화). 비판적 평가 #1 대응용 (미실행, GPU 확보 시).
 > 주의: train reward 절대값(예: pls 1.23 > probe 0.59)은 SR 우열과 무관 — 그룹 상대 advantage라 분산만 의미 있음. **비교는 eval SR 로만.**
 
 ### 6.3 cosine 이 실패한 이유 (교훈)
