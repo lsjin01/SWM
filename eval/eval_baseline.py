@@ -51,8 +51,9 @@ DATA_ROOT   = SWM_ROOT / "data" / "wmpo_data"   # fangqi/WMPO 256×256 데이터
 STATES_ROOT = SWM_ROOT / "data" / "states"       # states pkl (별도 경로)
 CKPTS_ROOT  = SWM_ROOT / "ckpts"
 
-# openvla-oft: prismatic 충돌 방지를 위해 experiments/robot 만 추가
-OPENVLA_OFT = Path("/home/mipstu/jiPark/openvla-oft")
+# openvla-oft: 로컬 dependencies 또는 환경변수로 경로 결정
+_openvla_default = SWM_ROOT / "dependencies" / "openvla-oft"
+OPENVLA_OFT = Path(os.environ.get("OPENVLA_OFT_PATH", str(_openvla_default)))
 OPENVLA_ROBOT = OPENVLA_OFT / "experiments" / "robot"
 for p in [str(SWM_ROOT), str(OPENVLA_ROBOT)]:
     if p not in sys.path:
@@ -65,28 +66,28 @@ TASK_CONFIG = {
         "task_id":     "square_D0",
         "unnorm_key":  "square_d0_300_demos",
         "max_steps":   184,
-        "instruction": "pick up the square nut and insert it onto the peg",
+        "instruction": "square",  # official WMPO instruction (eval.py line 170: args.task_description = args.task)
     },
     "coffee": {
         "env_name":    "Coffee_D0",
         "task_id":     "coffee_D0",
         "unnorm_key":  "coffee_d0_300_demos",
         "max_steps":   256,
-        "instruction": "pick up the coffee pod and place it into the coffee machine",
+        "instruction": "coffee",  # official WMPO instruction (rob_rollout.py line 196)
     },
     "stack_three": {
         "env_name":    "StackThree_D0",
         "task_id":     "stack_three_D0",
         "unnorm_key":  "stack_three_d0_300_demos",
         "max_steps":   320,
-        "instruction": "stack the three cubes on top of each other",
+        "instruction": "stack_three",  # official WMPO instruction (eval.py line 170)
     },
     "three_piece_assembly": {
         "env_name":    "ThreePieceAssembly_D0",
         "task_id":     "three_piece_assembly_D0",
         "unnorm_key":  "three_piece_assembly_d0_300_demos",
         "max_steps":   384,
-        "instruction": "assemble the three pieces together",
+        "instruction": "three_piece_assembly",  # official WMPO instruction (eval.py line 170)
     },
 }
 
@@ -100,7 +101,7 @@ def make_env(task: str):
 
     task_id  = TASK_CONFIG[task]["task_id"]
     # config는 기존 경로, HDF5는 WMPO 256×256 데이터
-    cfg_path = SWM_ROOT / "data" / "data_files" / "core_train_configs" / f"bc_rnn_image_ds_{task_id}_seed_101.json"
+    cfg_path = DATA_ROOT / "data_files" / "core_train_configs" / f"bc_rnn_image_ds_{task_id}_seed_101.json"
     hdf5     = DATA_ROOT / "data_files" / "core_datasets" / task / f"demo_src_{task}_task_D0" / "demo.hdf5"
 
     assert cfg_path.exists(), f"Config not found: {cfg_path}"
@@ -153,7 +154,7 @@ def center_crop_resize(image_np: np.ndarray):
 
 
 def load_vla(vla_base: str, device: torch.device):
-    """OpenVLA-OFT 모델 로드. openvla-oft auto_map 패치 포함."""
+    """OpenVLA-OFT 모델 로드. openvla-oft auto_map 패치 포함. LoRA 자동 적용."""
     from transformers import AutoModelForVision2Seq, AutoProcessor
 
     # openvla-oft auto_map 패치 (custom modeling_prismatic.py 경로 교정)
@@ -172,6 +173,16 @@ def load_vla(vla_base: str, device: torch.device):
         low_cpu_mem_usage=True,
         trust_remote_code=True,
     ).to(device)
+
+    # LoRA adapter가 있으면 적용 후 merge (SFT 모델: base + lora_adapter/)
+    lora_dir = Path(vla_base) / "lora_adapter"
+    if lora_dir.exists():
+        from peft import PeftModel
+        print(f"[VLA] Applying LoRA from {lora_dir} ...")
+        vla = PeftModel.from_pretrained(vla, str(lora_dir))
+        vla = vla.merge_and_unload()
+        print("[VLA] LoRA merged OK")
+
     processor = AutoProcessor.from_pretrained(vla_base, trust_remote_code=True)
 
     # dataset_statistics 로드
@@ -184,16 +195,16 @@ def load_vla(vla_base: str, device: torch.device):
     return vla, processor
 
 
+_PAD_TOKEN_ID = 32000  # tokenizer added_tokens.json: <PAD> → 32000
+
 @torch.no_grad()
 def get_action_chunk(vla, processor, image_np, instruction, unnorm_key, device,
                      chunk_size=8, wrist_image_np=None):
-    """WMPO rob_rollout.process_input과 동일: agentview + wrist 이미지 pixel_values concat."""
     prompt = f"In: What action should the robot take to {instruction.lower()}?\nOut:"
 
     pil = center_crop_resize(image_np)
     batch_feature = processor(prompt, pil)
 
-    # wrist 이미지가 있으면 pixel_values를 dim=1로 concat (모델이 2-image 입력으로 학습됨)
     if wrist_image_np is not None:
         wrist_pil = center_crop_resize(wrist_image_np)
         wrist_feature = processor(prompt, wrist_pil)
@@ -204,12 +215,32 @@ def get_action_chunk(vla, processor, image_np, instruction, unnorm_key, device,
     inputs = {k: (v.to(device, dtype=torch.bfloat16) if v.is_floating_point() else v.to(device))
               for k, v in batch_feature.items()}
 
-    with torch.autocast("cuda", dtype=torch.bfloat16):
-        result = vla.predict_action(**inputs, unnorm_key=unnorm_key, do_sample=False)
+    # 공식 WMPO 표준: rob_rollout.py L272-276 — input이 빈 토큰(29871)으로 끝나지 않으면 추가
+    _EMPTY_TOKEN_ID = 29871
+    input_ids = inputs["input_ids"]
+    if not torch.all(input_ids[:, -1] == _EMPTY_TOKEN_ID):
+        extra = torch.full((input_ids.shape[0], 1), _EMPTY_TOKEN_ID,
+                           dtype=input_ids.dtype, device=input_ids.device)
+        inputs["input_ids"] = torch.cat([input_ids, extra], dim=-1)
+        attn = inputs["attention_mask"]
+        inputs["attention_mask"] = torch.cat(
+            [attn, torch.ones((attn.shape[0], 1), dtype=attn.dtype, device=attn.device)], dim=-1
+        )
 
-    actions = result[0] if isinstance(result, tuple) else result
+    # 공식 WMPO 표준: generate_action_verl (rob_rollout.py line 506)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        actions, response, normalized_actions = vla.generate_action_verl(
+            **inputs,
+            unnorm_key=unnorm_key,
+            do_sample=False,
+            temperature=1.0,
+            padding_idx=_PAD_TOKEN_ID,
+        )
+
     if isinstance(actions, torch.Tensor):
         actions = actions.cpu().numpy()
+    if actions.ndim == 3:
+        actions = actions[0]
     if actions.ndim == 1:
         actions = np.tile(actions[np.newaxis], (chunk_size, 1))
     return actions[:chunk_size]

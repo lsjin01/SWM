@@ -15,3 +15,6 @@ data/
 *.pkl
 hf_token
 GROUP-B_key
+containers/
+dependencies/
+swm.egg-info/
